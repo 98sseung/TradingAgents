@@ -1,0 +1,29 @@
+"""Run: python -m pytest autotrader -q"""
+
+from autotrader import db
+from autotrader.board import board_texts, statuses
+
+
+def test_board_follows_the_pipeline():
+    state = {"market_report": "m", "sentiment_report": "",
+             "investment_debate_state": {"bull_history": "bull", "bear_history": ""}}
+    board = board_texts(state, ["market", "social"])
+    assert [name for name, _ in board][:4] == ["Market Analyst", "Sentiment Analyst", "Bull Researcher", "Bear Researcher"]
+    # sentiment still silent: it is working, nothing after it has started
+    assert statuses(board, 2, "running")[:4] == ["done", "working", "done", "waiting"]
+
+    state["sentiment_report"] = "s"
+    board = board_texts(state, ["market", "social"])
+    assert statuses(board, 2, "running")[:5] == ["done", "done", "done", "working", "waiting"]
+    assert statuses(board, 2, "failed")[3] == "error"
+
+
+def test_jobs_are_claimed_once_and_orphans_fail(tmp_path):
+    conn = db.connect(tmp_path / "bot.db")
+    first = db.enqueue(conn, "BTC-USD", "2026-11-03", ["market"])
+    db.enqueue(conn, "ETH-USD", "2026-11-03", ["market"])
+    assert db.claim_next(conn)["id"] == first
+    assert db.claim_next(conn)["ticker"] == "ETH-USD"
+    assert db.claim_next(conn) is None
+    assert db.fail_orphans(conn) == 2
+    assert db.usage_since(conn, 0)["failed"] == 2
