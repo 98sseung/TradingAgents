@@ -1,34 +1,33 @@
-# Trading Bot — 0단계 (분석·측정)
+# autotrader — Binance 선물 자동매매 (1단계: 데모)
 
-TradingAgents 분석을 대기열로 돌리고, GUI에서 에이전트별 진행 상황과 ChatGPT 플랜 사용량을 봅니다.
-매매는 하지 않습니다. 원본 `tradingagents/`, `cli/`는 수정하지 않고 가져다 씁니다.
+실행 방법과 사용법은 저장소 루트의 [`PLAY_README.md`](../PLAY_README.md)에 있습니다. 이 문서는 코드 구조만 다룹니다.
+원본 `tradingagents/`, `cli/`는 수정하지 않고 가져다 씁니다.
 
-## 설치 (최초 1회)
+## 프로세스 (서로 독립, SQLite 하나만 공유 · `python -m autotrader`로 한 번에 실행)
 
-```bash
-source .venv/bin/activate
-pip install -r autotrader/requirements.txt
-```
+| 모듈 | 실행 | 하는 일 |
+| --- | --- | --- |
+| `guard.py` | `python -m autotrader.guard` | Risk Guard. 5초마다 한도·KILL, 30초마다 원장 대사, 5분마다 보유기간 초과 청산 |
+| `worker.py` | `python -m autotrader.worker` | 대기열 분석 실행(TradingAgents), 체크포인트로 크래시 후 이어서 실행 |
+| `engine.py` | `python -m autotrader.engine` | Master. 매일 00:05 UTC 종목 선정·분석 등록, 이벤트 재분석, 판정·주문 실행 |
+| `gui.py` | `python -m autotrader.gui` | 관리 화면(로그인 필요). 명령은 `control` 테이블에 쓰기만 함 |
 
-LLM 설정은 CLI와 같이 `.env`의 `TRADINGAGENTS_*` 값을 씁니다 (provider `chatgpt`, 모델, 언어, 토론 라운드).
+## 라이브러리
 
-## 실행 (터미널 두 개)
+| 모듈 | 내용 |
+| --- | --- |
+| `binance.py` | Binance USDⓈ-M 클라이언트(데모/실전). 키는 `~/.config/trading-bot/secrets.env`. 거래량·심볼 분류는 실전 공개 데이터 사용 |
+| `trading.py` | 리스크 게이트(`decide`), 주문 실행(`execute`), 원장 대사·청산·한도. 규칙 상수는 파일 맨 위 |
+| `scanner.py` | 후보 선정: 거래대금 상위 20 코인 → 밈·90일 미만 제외 → 추세 뚜렷한 5개 |
+| `board.py` | 에이전트 보드(분석 단계별 상태) |
+| `db.py` | 스키마: `jobs`, `decisions`, `trades`, `control`, `events`, `heartbeat` |
 
-```bash
-python -m autotrader.worker   # 분석 워커: 대기열의 분석을 하나씩 실행
-python -m autotrader.gui      # 관리 화면: http://<이 PC의 IP>:8080 (예: http://192.168.189.131:8080)
-```
+## 안전 원칙
 
-- GUI는 기본으로 모든 네트워크에서 접속을 받습니다. 아직 로그인이 없으므로 같은 네트워크의 누구나 분석을 추가할 수 있습니다. 이 PC에서만 열려면 `TRADING_BOT_HOST=127.0.0.1`을 `.env`에 넣으세요.
-
-- 워커와 GUI는 서로 독립입니다. GUI를 꺼도 분석은 계속되고, 워커가 꺼지면 GUI의 Master가 빨간색이 됩니다.
-- 워커가 분석 도중 꺼지면, 다음에 켤 때 그 분석은 '실패'로 표시됩니다.
-- 기록은 `~/.trading-bot/bot.db`(바꾸려면 `TRADING_BOT_DB`), 리포트는 `~/.tradingagents/logs/reports/`에 저장됩니다.
-
-## 0단계에서 할 일
-
-코인 5개 정도를 하루 1번씩 1주일 돌리고, 화면의 "오늘" 줄(분석 수, LLM 호출, 토큰, 평균 시간, 실패)을 기록합니다.
-플랜 한도에 걸리면 해당 분석이 '실패'로 남고 오류 내용이 보드에 표시됩니다.
+- LLM 의견은 주문을 직접 내지 않습니다. `trading.decide`의 결정론적 게이트를 통과해야 하고, 모든 판정은 이유와 함께 `decisions`에 남습니다.
+- 주문 client id는 판정 id에서 만들어져, 재실행해도 중복 주문이 나가지 않습니다.
+- 진입 후 손절 주문을 걸지 못하면 즉시 청산합니다. 청산도 실패하면 KILL로 잠급니다.
+- `source='manual'`(GUI) 분석은 절대 매매로 이어지지 않습니다.
 
 ## 테스트
 

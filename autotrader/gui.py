@@ -4,13 +4,22 @@ Run it beside the worker:  python -m autotrader.gui   ->  http://<this machine's
 Look and colours: theme.css.
 """
 
+import asyncio
+import hmac
 import json
 import os
+import secrets
+import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
 
-from nicegui import app, ui
+from fastapi.responses import RedirectResponse
+
+# Session files go beside the bot's db, not into whatever directory the GUI was started from (the repo).
+os.environ.setdefault("NICEGUI_STORAGE_PATH", str(Path.home() / ".trading-bot" / "nicegui"))
+from nicegui import app, ui  # noqa: E402  (reads NICEGUI_STORAGE_PATH at import)
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from autotrader import db
 from autotrader.board import by_stage, statuses
@@ -26,11 +35,60 @@ AGENT_LOOK = {"waiting": ("대기", ""), "working": ("작업 중", "run"), "done
 JOB_LOOK = {"queued": ("대기열", ""), "running": ("실행 중", "run"), "done": ("완료", "done"), "failed": ("실패", "bad")}
 RATINGS = {"Buy", "Overweight", "Hold", "Underweight", "Sell"}
 QUICK_PICKS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD"]
-ALIVE_SECONDS = 20  # the worker beats every 5 s
+ALIVE_SECONDS = 60  # the slowest process (engine) beats every 30 s
+PROCESSES = [("engine", "Master"), ("worker", "Worker"), ("guard", "Risk Guard")]  # heartbeat name, label
 
 conn = db.connect()
 REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
 app.add_static_files("/reports", REPORTS_ROOT)
+SESSION_SECRET_FILE = db.DB_PATH.parent / "gui_session_secret"
+
+
+class LoginRequired(BaseHTTPMiddleware):
+    """Every page and report file needs a signed-in session; only the login page and NiceGUI's assets are open."""
+
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if not app.storage.user.get("authenticated") and path != "/login" and not path.startswith("/_nicegui"):
+            return RedirectResponse("/login")
+        return await call_next(request)
+
+
+app.add_middleware(LoginRequired)
+
+
+@ui.page("/login")
+def login() -> RedirectResponse | None:
+    if app.storage.user.get("authenticated"):
+        return RedirectResponse("/")
+    ui.add_head_html(FONTS)
+    ui.add_css(THEME)
+
+    async def try_login() -> None:
+        if hmac.compare_digest(password.value.encode(), os.environ["TRADING_BOT_GUI_PASSWORD"].encode()):
+            app.storage.user["authenticated"] = True
+            ui.navigate.to("/")
+        else:
+            await asyncio.sleep(1)  # slows guessing
+            ui.notify("비밀번호가 틀렸습니다", type="negative")
+
+    with ui.element("div").classes("min-h-screen w-full grid place-items-center p-4"), \
+            ui.element("div").classes("panel p-8 w-full max-w-sm flex flex-col gap-4"):
+        with ui.row().classes("items-center gap-2"):
+            ui.icon("candlestick_chart", size="28px").classes("text-sky-400")
+            ui.label("TRADING BOT").classes("brand text-xl")
+        password = ui.input("비밀번호", password=True, password_toggle_button=True).props("outlined autofocus")
+        password.on("keydown.enter", try_login)
+        ui.button("로그인", icon="login", on_click=try_login).props("unelevated").classes("w-full")
+    return None
+
+
+def _session_secret() -> str:
+    """Signs session cookies; kept on disk so a restart does not sign everyone out."""
+    if not SESSION_SECRET_FILE.exists():
+        SESSION_SECRET_FILE.write_text(secrets.token_hex(32))
+        SESSION_SECRET_FILE.chmod(0o600)
+    return SESSION_SECRET_FILE.read_text().strip()
 
 
 def _dot(kind: str) -> None:
@@ -68,6 +126,52 @@ def _show_text(title: str, text: str) -> None:
     dialog.open()
 
 
+ACTION_LOOK = {"open_long": ("롱 진입", "r-buy"), "open_short": ("숏 진입", "r-sell"), "close": ("청산", "r-underweight"),
+               "hold": ("유지", "r-review"), "none": ("진입 안 함", "r-review")}
+
+
+def _action(action: str) -> None:
+    label, look = ACTION_LOOK.get(action, (action, "r-review"))
+    ui.label(label).classes(f"rating {look} whitespace-nowrap")
+
+
+def _side(side: str) -> None:
+    ui.label(side).classes("rating whitespace-nowrap " + ("r-buy" if side == "LONG" else "r-sell"))
+
+
+def _age(since: float) -> str:
+    hours = (time.time() - since) / 3600
+    return f"{hours:.0f}시간" if hours < 48 else f"{hours / 24:.1f}일"
+
+
+def _control(key: str) -> str | None:
+    row = conn.execute("SELECT value FROM control WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def _set_control(key: str, value: str) -> None:
+    # The engine and risk guard read these keys; the GUI only ever writes stop/kill.
+    conn.execute("INSERT INTO control (key, value, updated_at) VALUES (?, ?, ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                 (key, value, time.time()))
+    conn.execute("INSERT INTO events (at, level, source, message) VALUES (?, 'warn', 'gui', ?)",
+                 (time.time(), f"{key} set to {value} from the GUI"))
+
+
+def _confirm(title: str, body: str, on_yes) -> None:
+    with ui.dialog() as dialog, ui.element("div").classes("panel p-6 w-[min(480px,92vw)] flex flex-col gap-4"):
+        ui.label(title).classes("text-lg font-bold")
+        ui.label(body).classes("text-sm text-slate-300")
+        with ui.row().classes("justify-end w-full gap-2"):
+            ui.button("취소", on_click=dialog.close).props("flat color=grey")
+
+            def yes() -> None:
+                on_yes()
+                dialog.close()
+            ui.button("확인", on_click=yes).props("unelevated color=negative")
+    dialog.open()
+
+
 def _today() -> float:
     return datetime.combine(date.today(), datetime.min.time()).timestamp()
 
@@ -91,20 +195,48 @@ def index() -> None:
             ui.row().classes("max-w-[1920px] mx-auto px-4 md:px-6 py-3 items-center gap-3 no-wrap"):
             ui.icon("candlestick_chart", size="28px").classes("text-sky-400")
             ui.label("TRADING BOT").classes("brand text-xl whitespace-nowrap")
-            ui.label("PHASE 0").classes("chip")
+            ui.label("PHASE 1").classes("chip")
+            live = os.environ.get("TRADING_BOT_MODE", "demo") == "live"
+            ui.label("LIVE" if live else "DEMO").classes("chip " + ("text-rose-400" if live else "text-sky-400"))
             ui.space()
 
             @ui.refreshable
+            def control_bar() -> None:
+                if _control("kill") == "1":
+                    ui.label("KILL · 잠김").classes("chip text-rose-400")
+                    ui.button("잠금 해제", icon="lock_open", on_click=lambda: _confirm(
+                        "잠금을 해제할까요?", "자동매매가 다시 신규 진입을 할 수 있게 됩니다.",
+                        lambda: _set_control("kill", "0"))).props("outline dense rounded color=grey")
+                    return
+                stopped = _control("stop") == "1"
+                if stopped:
+                    ui.label("STOP · 신규 진입 중단").classes("chip text-amber-400")
+                ui.button("재개" if stopped else "STOP", icon="play_arrow" if stopped else "pause",
+                          on_click=lambda: _set_control("stop", "0" if stopped else "1")
+                          ).props("outline dense rounded color=amber").tooltip("신규 진입만 멈춤 · 기존 포지션의 손절·익절은 유지")
+                ui.button("KILL", icon="dangerous", on_click=lambda: _confirm(
+                    "KILL 할까요?", "모든 미체결 주문을 취소하고, 모든 포지션을 시장가로 청산한 뒤, 잠금 해제 전까지 주문을 막습니다.",
+                    lambda: _set_control("kill", "1"))).props("unelevated dense rounded color=negative")
+
+            control_bar()
+
+            @ui.refreshable
             def master_chip() -> None:
-                beat = db.heartbeat(conn, "master")
-                alive = beat is not None and time.time() - beat["at"] < ALIVE_SECONDS
-                with ui.element("div").classes("chip"):
-                    _dot("ok" if alive else "bad")
-                    ui.label(f"Master · {beat['note']}" if alive else "Master · 워커 꺼짐")
-                if not alive:
-                    ui.tooltip("python -m autotrader.worker 로 워커를 켜세요")
+                for name, label in PROCESSES:
+                    beat = db.heartbeat(conn, name)
+                    alive = beat is not None and time.time() - beat["at"] < ALIVE_SECONDS
+                    with ui.element("div").classes("chip"):
+                        _dot("ok" if alive else "bad")
+                        ui.label(f"{label} · {beat['note'] or '정상'}" if alive else f"{label} · 꺼짐")
+                    ui.tooltip(f"python -m autotrader.{name}")
 
             master_chip()
+
+            def logout() -> None:
+                app.storage.user.clear()
+                ui.navigate.to("/login")
+
+            ui.button(icon="logout", on_click=logout).props("flat round dense color=grey").tooltip("로그아웃")
 
     with ui.element("div").classes("max-w-[1920px] mx-auto w-full p-4 md:p-6 grid grid-cols-1 xl:grid-cols-12 gap-4"):
         # ── left: new analysis + history ──
@@ -163,6 +295,8 @@ def index() -> None:
                                 with ui.row().classes("items-center gap-2 no-wrap"):
                                     _dot(JOB_LOOK.get(job["status"], ("", ""))[1])
                                     ui.label(job["ticker"]).classes("font-semibold mono")
+                                    if job["source"] == "engine":
+                                        ui.label("자동").classes("chip text-sky-400").tooltip("엔진이 넣은 분석 · 매매로 이어질 수 있음")
                                 _rating(job["rating"])
                             ui.label(f"#{job['id']} · {job['trade_date']} · {_duration(job)} · LLM {job['llm_calls'] or 0}"
                                      ).classes("text-xs text-slate-500 mono")
@@ -184,8 +318,10 @@ def index() -> None:
                     ("bolt", "LLM 호출", usage["llm_calls"], "text-sky-400"),
                     ("token", "토큰", f"{(usage['tokens_in'] + usage['tokens_out']) / 1000:,.1f}k", "text-violet-400"),
                     ("timer", "평균 소요", f"{int(avg) // 60}:{int(avg) % 60:02d}" if avg else "--:--", "text-slate-300"),
+                    ("account_balance_wallet", "자산 USDT", f"{float(_control('equity') or 0):,.2f}"
+                     if _control("equity") else "--", "text-emerald-300"),
                 ]
-                with ui.element("div").classes("grid grid-cols-2 md:grid-cols-3 2xl:grid-cols-6 gap-3"):
+                with ui.element("div").classes("grid grid-cols-2 md:grid-cols-4 2xl:grid-cols-7 gap-3"):
                     for icon, label, value, colour in tiles:
                         with ui.element("div").classes("panel kpi"):
                             with ui.row().classes("items-center gap-2 no-wrap"):
@@ -227,6 +363,14 @@ def index() -> None:
                         with ui.row().classes("items-center gap-2 text-rose-400 text-sm no-wrap"):
                             ui.icon("warning")
                             ui.label(job["error"]).classes("break-all")
+                    decision = conn.execute("SELECT * FROM decisions WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+                                            (job["id"],)).fetchone()
+                    if decision:
+                        with ui.row().classes("items-center gap-2 text-sm no-wrap"):
+                            ui.icon("rule", size="18px").classes("text-slate-400")
+                            ui.label("리스크 게이트").classes("text-slate-400 whitespace-nowrap")
+                            _action(decision["action"])
+                            ui.label(decision["reason"]).classes("text-slate-300 break-all")
 
                     with ui.element("div").classes("grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3"):
                         for number, (title, icon, agents) in enumerate(by_stage(board, status_list), start=1):
@@ -251,30 +395,107 @@ def index() -> None:
 
             board_view()
 
+            with ui.element("div").classes("grid grid-cols-1 2xl:grid-cols-2 gap-4"):
+                with ui.element("div").classes("panel p-5 flex flex-col gap-3 min-w-0"):
+                    ui.label("포지션").classes("panel-title")
+
+                    @ui.refreshable
+                    def positions() -> None:
+                        open_trades = conn.execute("SELECT * FROM trades WHERE status = 'open' ORDER BY id DESC").fetchall()
+                        closed = conn.execute(
+                            "SELECT * FROM trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 5").fetchall()
+                        if not open_trades and not closed:
+                            ui.label("아직 거래가 없습니다").classes("text-sm text-slate-500")
+                        for trade in open_trades:
+                            with ui.element("div").classes("job w-full"):
+                                with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                                    _side(trade["side"])
+                                    ui.label(trade["symbol"]).classes("font-semibold mono")
+                                    ui.space()
+                                    ui.label(f"보유 {_age(trade['opened_at'])}").classes("text-xs text-slate-400")
+                                ui.label(f"수량 {trade['qty']} · 진입 {trade['entry_price']} · 손절 {trade['stop']}"
+                                         f" · 목표 {trade['target']}").classes("text-xs text-slate-400 mono")
+                        if closed:
+                            ui.label("최근 청산").classes("text-xs text-slate-500 mt-2")
+                        for trade in closed:
+                            with ui.row().classes("items-center gap-2 w-full no-wrap px-3 text-sm"):
+                                _side(trade["side"])
+                                ui.label(trade["symbol"]).classes("mono")
+                                ui.label(trade["exit_reason"] or "").classes("text-xs text-slate-500")
+                                ui.space()
+                                if trade["realized_pnl"] is None:  # Binance posts income a little after the fill
+                                    ui.label("손익 집계 중").classes("text-xs text-slate-500")
+                                    continue
+                                # fees are stored as a positive cost
+                                pnl = float(trade["realized_pnl"]) - float(trade["fees"] or 0) + float(trade["funding"] or 0)
+                                ui.label(f"{pnl:+.2f} USDT").classes(
+                                    "mono " + ("text-emerald-400" if pnl >= 0 else "text-rose-400"))
+
+                    positions()
+
+                with ui.element("div").classes("panel p-5 flex flex-col gap-3 min-w-0"):
+                    ui.label("결정 · 이벤트").classes("panel-title")
+
+                    @ui.refreshable
+                    def activity() -> None:
+                        rows = conn.execute(
+                            "SELECT 'decision' AS kind, created_at AS at, symbol, rating, action, reason AS text, NULL AS level"
+                            " FROM decisions UNION ALL"
+                            " SELECT 'event', at, source, NULL, NULL, message, level FROM events"
+                            " ORDER BY at DESC LIMIT 15").fetchall()
+                        if not rows:
+                            ui.label("아직 기록이 없습니다").classes("text-sm text-slate-500")
+                        for row in rows:
+                            with ui.row().classes("items-start gap-2 w-full no-wrap text-sm"):
+                                ui.label(datetime.fromtimestamp(row["at"]).strftime("%m-%d %H:%M")
+                                         ).classes("text-xs text-slate-500 mono whitespace-nowrap pt-0.5")
+                                if row["kind"] == "decision":
+                                    ui.label(row["symbol"]).classes("mono whitespace-nowrap")
+                                    _action(row["action"])
+                                else:
+                                    ui.icon({"error": "error", "warn": "warning"}.get(row["level"], "info"), size="16px"
+                                            ).classes({"error": "text-rose-400", "warn": "text-amber-400"}.get(
+                                                row["level"], "text-sky-400"))
+                                    ui.label(row["symbol"]).classes("text-slate-400 whitespace-nowrap")
+                                ui.label(row["text"]).classes("text-slate-300 break-all")
+
+                    activity()
+
     def pick(job_id: int) -> None:
         selected["job"] = job_id
         refresh()
 
     def refresh() -> None:
-        beat = db.heartbeat(conn, "master")
-        if changed("master", (beat is not None and time.time() - beat["at"] < ALIVE_SECONDS, beat and beat["note"])):
+        beats = [db.heartbeat(conn, name) for name, _ in PROCESSES]
+        if changed("master", tuple((b is not None and time.time() - b["at"] < ALIVE_SECONDS, b and b["note"])
+                                   for b in beats)):
             master_chip.refresh()
-        if changed("kpis", tuple(db.usage_since(conn, _today()))):
+        if changed("kpis", (tuple(db.usage_since(conn, _today())), _control("equity"))):
             kpis.refresh()
         jobs = db.recent_jobs(conn)
-        if changed("jobs", (selected["job"], tuple(tuple(j) for j in jobs))):
+        last_decision = conn.execute("SELECT MAX(id) FROM decisions").fetchone()[0]
+        if changed("jobs", (selected["job"], tuple(tuple(j) for j in jobs), last_decision)):
             job_list.refresh()
             board_view.refresh()
+        if changed("control", tuple(tuple(r) for r in conn.execute("SELECT key, value FROM control"))):
+            control_bar.refresh()
+        if changed("trades", tuple(tuple(r) for r in conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 20"))):
+            positions.refresh()
+        last_event = conn.execute("SELECT MAX(id) FROM events").fetchone()[0]
+        if changed("activity", (last_decision, last_event)):
+            activity.refresh()
 
     ui.timer(2.0, refresh)
 
 
 def main() -> None:
-    # shortcut: no login, so anyone on the LAN can queue analyses; add auth before phase 1 puts trading controls here.
+    if len(os.environ.get("TRADING_BOT_GUI_PASSWORD", "")) < 8:
+        sys.exit("Set TRADING_BOT_GUI_PASSWORD (8+ characters) in .env before starting the GUI.")
+    # shortcut: plain HTTP, so the password crosses the LAN unencrypted; put it behind HTTPS/VPN before exposing it further.
     # TRADING_BOT_HOST=127.0.0.1 keeps it on this machine only.
     host = os.environ.get("TRADING_BOT_HOST", "0.0.0.0")
     ui.run(host=host, port=int(os.environ.get("TRADING_BOT_PORT", "8080")), title="Trading Bot",
-           reload=False, show=False, language="ko-KR", dark=True)
+           reload=False, show=False, language="ko-KR", dark=True, storage_secret=_session_secret())
 
 
 if __name__ in {"__main__", "__mp_main__"}:

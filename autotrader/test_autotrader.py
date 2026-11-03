@@ -24,12 +24,26 @@ def test_board_follows_the_pipeline():
     assert sum(len(agents) for _, _, agents in stages) == len(board)  # every row lands in a column
 
 
-def test_jobs_are_claimed_once_and_orphans_fail(tmp_path):
+def test_levels_are_read_from_rendered_proposals():
+    from autotrader.worker import level
+    plan = "**Action**: Sell\n\n**Entry Price**: not provided\n\n**Stop Loss**: 2219.09\n"
+    assert level(plan, "Stop Loss") == 2219.09
+    assert level(plan, "Entry Price") is None
+    assert level("**Price Target**: $78,250.5", "Price Target") == 78250.5
+    assert level("", "Stop Loss") is None
+
+
+def test_jobs_are_claimed_once_and_orphans_resume_then_fail(tmp_path):
     conn = db.connect(tmp_path / "bot.db")
     first = db.enqueue(conn, "BTC-USD", "2026-11-03", ["market"])
     db.enqueue(conn, "ETH-USD", "2026-11-03", ["market"])
     assert db.claim_next(conn)["id"] == first
     assert db.claim_next(conn)["ticker"] == "ETH-USD"
     assert db.claim_next(conn) is None
-    assert db.fail_orphans(conn) == 2
-    assert db.usage_since(conn, 0)["failed"] == 2
+    # worker died: both resume once
+    assert db.requeue_orphans(conn) == 2
+    assert db.claim_next(conn)["attempts"] == 2
+    # died again on the first one: it is failed, not requeued
+    assert db.requeue_orphans(conn) == 0
+    usage = db.usage_since(conn, 0)
+    assert (usage["failed"], usage["pending"]) == (1, 1)  # ETH still waits in the queue

@@ -71,7 +71,7 @@ body {
 
 /* KPI tiles */
 .kpi { padding: 14px 16px; }
-.kpi-value { font-size: 1.55rem; font-weight: 700; line-height: 1.1; }
+.kpi-value { font-size: 1.35rem; font-weight: 700; line-height: 1.1; }
 .kpi-label { font-size: 0.72rem; color: var(--muted); }
 
 /* pipeline */
