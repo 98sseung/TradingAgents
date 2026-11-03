@@ -1,0 +1,128 @@
+/* Dark trading-terminal theme for the trading-bot GUI. Colours live in the variables below. */
+:root {
+  --bg: #070b14;
+  --panel: rgba(15, 23, 42, 0.72);
+  --panel-hi: rgba(30, 41, 59, 0.75);
+  --line: rgba(148, 163, 184, 0.14);
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --dim: #64748b;
+  --accent: #38bdf8;
+  --accent-2: #a78bfa;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --bad: #ef4444;
+  --ui-scale: 1.15;  /* whole-page size: raise for bigger text and controls */
+}
+@media (min-width: 1800px) { :root { --ui-scale: 1.3; } }
+@media (max-width: 640px) { :root { --ui-scale: 1; } }
+
+body {
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(56, 189, 248, 0.10), transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, rgba(167, 139, 250, 0.10), transparent 55%),
+    var(--bg) !important;
+  color: var(--text);
+  font-family: "Inter", "Noto Sans KR", system-ui, sans-serif;
+  zoom: var(--ui-scale);  /* scales Quasar's px-sized controls too, which rem sizes would miss */
+}
+.nicegui-content { padding: 0 !important; }
+.mono { font-family: "JetBrains Mono", ui-monospace, monospace; font-feature-settings: "tnum"; }
+
+/* panels */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  backdrop-filter: blur(10px);
+  box-shadow: 0 10px 30px -12px rgba(0, 0, 0, 0.6);
+}
+.panel-title {
+  font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--muted); font-weight: 600;
+}
+
+/* top bar */
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  background: rgba(7, 11, 20, 0.75);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--line);
+}
+.brand {
+  font-weight: 800; letter-spacing: -0.02em;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600;
+  border: 1px solid var(--line); background: var(--panel-hi); color: var(--muted);
+  white-space: nowrap;
+}
+
+/* status dot */
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--dim); }
+.dot.ok { background: var(--ok); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6); animation: ping 1.8s infinite; }
+.dot.run { background: var(--accent); box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.6); animation: ping 1.4s infinite; }
+.dot.bad { background: var(--bad); }
+.dot.done { background: var(--ok); }
+@keyframes ping { 70% { box-shadow: 0 0 0 7px rgba(0, 0, 0, 0); } 100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); } }
+
+/* KPI tiles */
+.kpi { padding: 14px 16px; }
+.kpi-value { font-size: 1.55rem; font-weight: 700; line-height: 1.1; }
+.kpi-label { font-size: 0.72rem; color: var(--muted); }
+
+/* pipeline */
+.stage-head { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.8rem; font-weight: 600; }
+.stage-num {
+  width: 22px; height: 22px; border-radius: 7px; display: grid; place-items: center;
+  font-size: 0.7rem; background: var(--panel-hi); border: 1px solid var(--line); color: var(--text);
+}
+.agent {
+  position: relative; min-width: 0; padding: 12px 14px; border-radius: 12px; cursor: pointer;
+  background: var(--panel-hi); border: 1px solid var(--line);
+  transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.agent:hover { transform: translateY(-2px); border-color: rgba(56, 189, 248, 0.45); }
+.agent.st-waiting { opacity: 0.55; }
+.agent.st-done { border-left: 3px solid var(--ok); }
+.agent.st-error { border-color: rgba(239, 68, 68, 0.6); }
+.agent.st-working {
+  border-color: rgba(56, 189, 248, 0.7);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.25), 0 0 24px -4px rgba(56, 189, 248, 0.45);
+  animation: glow 2s ease-in-out infinite;
+}
+@keyframes glow { 50% { box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.1), 0 0 10px -4px rgba(56, 189, 248, 0.25); } }
+.agent-name { font-weight: 700; font-size: 0.9rem; }
+.agent-role { font-size: 0.7rem; color: var(--dim); }
+.agent-text {
+  margin-top: 8px; font-size: 0.72rem; color: var(--muted); line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+
+/* ratings */
+.rating { padding: 3px 10px; border-radius: 8px; font-weight: 700; font-size: 0.78rem; border: 1px solid; }
+.r-buy { color: #4ade80; border-color: rgba(74, 222, 128, 0.4); background: rgba(34, 197, 94, 0.12); }
+.r-overweight { color: #a3e635; border-color: rgba(163, 230, 53, 0.4); background: rgba(132, 204, 22, 0.12); }
+.r-hold { color: #facc15; border-color: rgba(250, 204, 21, 0.4); background: rgba(234, 179, 8, 0.12); }
+.r-underweight { color: #fb923c; border-color: rgba(251, 146, 60, 0.4); background: rgba(249, 115, 22, 0.12); }
+.r-sell { color: #f87171; border-color: rgba(248, 113, 113, 0.4); background: rgba(239, 68, 68, 0.12); }
+.r-review { color: var(--muted); border-color: var(--line); background: var(--panel-hi); }
+
+/* job list */
+.job {
+  padding: 10px 12px; border-radius: 10px; cursor: pointer; border: 1px solid transparent;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.job:hover { background: var(--panel-hi); }
+.job.active { background: var(--panel-hi); border-color: rgba(56, 189, 248, 0.45); }
+
+/* dialog markdown */
+.report-md { color: var(--text); font-size: 0.9rem; line-height: 1.65; }
+.report-md table { border-collapse: collapse; margin: 8px 0; }
+.report-md th, .report-md td { border: 1px solid var(--line); padding: 4px 8px; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.25); border-radius: 8px; }

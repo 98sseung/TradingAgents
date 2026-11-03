@@ -1,7 +1,7 @@
 """Run: python -m pytest autotrader -q"""
 
 from autotrader import db
-from autotrader.board import board_texts, statuses
+from autotrader.board import board_texts, by_stage, statuses
 
 
 def test_board_follows_the_pipeline():
@@ -16,6 +16,12 @@ def test_board_follows_the_pipeline():
     board = board_texts(state, ["market", "social"])
     assert statuses(board, 2, "running")[:5] == ["done", "done", "done", "working", "waiting"]
     assert statuses(board, 2, "failed")[3] == "error"
+
+    stages = by_stage(board, statuses(board, 2, "running"))
+    assert [title for title, _, _ in stages] == ["분석", "리서치", "트레이딩", "리스크", "결정"]
+    assert [name for name, *_ in stages[0][2]] == ["Market Analyst", "Sentiment Analyst"]  # only selected analysts
+    assert stages[1][2][1][3] == "working"  # Bear Researcher
+    assert sum(len(agents) for _, _, agents in stages) == len(board)  # every row lands in a column
 
 
 def test_jobs_are_claimed_once_and_orphans_fail(tmp_path):

@@ -20,6 +20,26 @@ LATER_STAGES = [
 ]
 
 
+# The pipeline columns the GUI draws: (title, icon, the agents in it, each with a one-word role).
+STAGES = [
+    ("분석", "query_stats", {"Market Analyst": "기술적 분석", "Sentiment Analyst": "여론",
+                            "News Analyst": "뉴스·거시", "Fundamentals Analyst": "재무"}),
+    ("리서치", "forum", {"Bull Researcher": "강세 논거", "Bear Researcher": "약세 논거",
+                        "Research Manager": "투자 계획"}),
+    ("트레이딩", "swap_horiz", {"Trader": "매매 제안"}),
+    ("리스크", "shield", {"Aggressive Analyst": "공격적", "Conservative Analyst": "보수적",
+                         "Neutral Analyst": "중립"}),
+    ("결정", "gavel", {"Portfolio Manager": "최종 결정"}),
+]
+
+
+def by_stage(board: list[list[str]], status_list: list[str]) -> list[tuple[str, str, list[tuple[str, str, str, str]]]]:
+    """Board rows grouped into STAGES: [(title, icon, [(name, role, text, status), ...]), ...]."""
+    rows = {name: (text, status) for (name, text), status in zip(board, status_list, strict=True)}
+    return [(title, icon, [(name, role, *rows[name]) for name, role in agents.items() if name in rows])
+            for title, icon, agents in STAGES]
+
+
 def board_texts(state: dict, analysts: list[str]) -> list[list[str]]:
     """[[agent name, text so far], ...] for the selected analysts, then every later stage."""
     rows = [[ANALYST_AGENT_NAMES[a], state.get(ANALYST_REPORT_MAP[a]) or ""]
