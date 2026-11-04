@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, at REAL NOT NULL, level TEXT NOT NULL, source TEXT NOT NULL,
     message TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS outcomes (
+    job_id INTEGER, horizon_h INTEGER, symbol TEXT, rating TEXT, entry TEXT, exit TEXT,
+    ret_pct REAL, verdict TEXT, scored_at REAL, PRIMARY KEY (job_id, horizon_h)
+);
 """
 MAX_ATTEMPTS = 2  # a job that takes the worker down twice is failed, not retried forever
 ADDED_COLUMNS = {

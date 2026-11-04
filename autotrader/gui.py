@@ -334,6 +334,8 @@ def index() -> None:
             def kpis() -> None:
                 usage = db.usage_since(conn, _today())
                 avg = usage["avg_seconds"]
+                correct, n = conn.execute("SELECT COALESCE(SUM(verdict = 'correct'), 0), COUNT(*) FROM outcomes "
+                                          "WHERE horizon_h = 120 AND verdict IN ('correct', 'wrong')").fetchone()
                 tiles = [
                     ("task_alt", "오늘 완료", usage["done"] or 0, "text-emerald-400"),
                     ("error_outline", "실패", usage["failed"] or 0, "text-rose-400"),
@@ -343,14 +345,17 @@ def index() -> None:
                     ("timer", "평균 소요", f"{int(avg) // 60}:{int(avg) % 60:02d}" if avg else "--:--", "text-slate-300"),
                     ("account_balance_wallet", "자산 USDT", f"{float(_control('equity') or 0):,.2f}"
                      if _control("equity") else "--", "text-emerald-300"),
+                    ("fact_check", "적중률 (5일)", f"{correct / n:.0%}" if n else "–", "text-sky-400"),
                 ]
-                with ui.element("div").classes("grid grid-cols-2 md:grid-cols-4 2xl:grid-cols-7 gap-3"):
+                with ui.element("div").classes("grid grid-cols-2 md:grid-cols-4 2xl:grid-cols-8 gap-3"):
                     for icon, label, value, colour in tiles:
                         with ui.element("div").classes("panel kpi"):
                             with ui.row().classes("items-center gap-2 no-wrap"):
                                 ui.icon(icon, size="18px").classes(colour)
                                 ui.label(label).classes("kpi-label")
                             ui.label(str(value)).classes("kpi-value mono mt-1")
+                            if label == "적중률 (5일)":
+                                ui.label(f"n={n}").classes("kpi-label mono")
 
             kpis()
 
@@ -486,6 +491,29 @@ def index() -> None:
 
                     activity()
 
+            with ui.element("div").classes("panel p-5 flex flex-col gap-3 min-w-0"):
+                ui.label("분석 채점").classes("panel-title")
+
+                @ui.refreshable
+                def outcome_list() -> None:
+                    rows = conn.execute("SELECT o.*, j.ticker FROM outcomes o JOIN jobs j ON j.id = o.job_id "
+                                        "ORDER BY o.scored_at DESC, o.job_id DESC, o.horizon_h DESC LIMIT 15").fetchall()
+                    if not rows:
+                        ui.label("분석 완료 후 1일·5일이 지나면 자동 채점합니다").classes("text-sm text-slate-500")
+                    for row in rows:
+                        with ui.row().classes("items-center gap-2 w-full text-sm"):
+                            ui.label(row["ticker"]).classes("mono font-semibold")
+                            _rating(row["rating"])
+                            ui.label("1일" if row["horizon_h"] == 24 else "5일").classes("text-slate-400")
+                            ui.space()
+                            ui.label(f"{row['ret_pct']:+.2f}%").classes("mono")
+                            label, colour = {"correct": ("맞음", "text-emerald-400"),
+                                             "wrong": ("틀림", "text-rose-400"),
+                                             "inconclusive": ("보류", "text-amber-400")}[row["verdict"]]
+                            ui.label(label).classes(f"chip {colour}")
+
+                outcome_list()
+
     def pick(job_id: int) -> None:
         selected["job"] = job_id
         refresh()
@@ -496,8 +524,11 @@ def index() -> None:
                               for b in beats)
         if changed("master", (process_state, _worker_status(conn, time.time()))):
             master_chip.refresh()
-        if changed("kpis", (tuple(db.usage_since(conn, _today())), _control("equity"))):
+        outcome_count = conn.execute("SELECT COUNT(*) FROM outcomes").fetchone()[0]
+        if changed("kpis", (tuple(db.usage_since(conn, _today())), _control("equity"), outcome_count)):
             kpis.refresh()
+        if changed("outcomes", outcome_count):
+            outcome_list.refresh()
         jobs = db.recent_jobs(conn)
         last_decision = conn.execute("SELECT MAX(id) FROM decisions").fetchone()[0]
         if changed("jobs", (selected["job"], tuple(tuple(j) for j in jobs), last_decision)):

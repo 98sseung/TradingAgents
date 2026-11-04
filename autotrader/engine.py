@@ -5,7 +5,7 @@ import time
 from datetime import UTC, datetime
 from decimal import Decimal as D
 
-from autotrader import db, scanner, trading
+from autotrader import db, feedback, scanner, trading
 from autotrader.binance import BinanceClient
 
 INTERVAL, EVENT_INTERVAL, REANALYSIS_AGE, GUARD_AGE = 30, 300, 6 * 3600, 30
@@ -111,6 +111,12 @@ def step(conn, client, now):
             except Exception as exc:
                 _event(conn, "error", f"{symbol}: event analysis failed ({type(exc).__name__})")
     _jobs(conn, client, now)
+    if now - float(trading._get(conn, "engine_feedback_at", "-inf")) >= 3600:
+        trading._set(conn, "engine_feedback_at", now)
+        try:
+            feedback.score(conn, client, now)
+        except Exception as exc:
+            _event(conn, "error", f"Analysis scoring failed ({type(exc).__name__})")
     db.beat(conn, "engine", "idle")
 
 
