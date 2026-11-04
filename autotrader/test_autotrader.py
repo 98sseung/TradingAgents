@@ -173,10 +173,11 @@ def test_checkpoint_identity_and_resume_are_preserved(tmp_path, monkeypatch, int
         assert config["checkpoint_enabled"] is True
         handlers.extend(callbacks)
         return SimpleNamespace(
-            create_run_state=lambda *run: {}, propagator=SimpleNamespace(get_graph_args=lambda **kwargs: {}),
-            begin_checkpoint=lambda *run: calls.append(("begin", run)) or "saved-thread",
+            create_run_state=lambda *run, portfolio: calls.append(("create", (*run, portfolio))) or {},
+            propagator=SimpleNamespace(get_graph_args=lambda **kwargs: {}),
+            begin_checkpoint=lambda *run, portfolio: calls.append(("begin", (*run, portfolio))) or "saved-thread",
             checkpoint_input=lambda state: None, stream_run=stream, record_decision=lambda *args: None,
-            clear_checkpoint_on_success=lambda *run: calls.append(("clear", run)),
+            clear_checkpoint_on_success=lambda *run, portfolio: calls.append(("clear", (*run, portfolio))),
             end_checkpoint=lambda: calls.append(("end", None)),
             default_report_path=lambda ticker: tmp_path / ticker, save_reports=lambda *args: None)
     monkeypatch.setattr(worker, "TradingAgentsGraph", graph)
@@ -187,7 +188,12 @@ def test_checkpoint_identity_and_resume_are_preserved(tmp_path, monkeypatch, int
     else:
         worker.run_job(conn, job)
         assert db.get_job(conn, job["id"])["status"] == "done"
-    assert calls[0] == ("begin", ("BTC-USDT", "2026-11-03", "crypto")) and calls[-1] == ("end", None)
+    assert calls[0][0] == "create" and calls[1][0] == "begin" and calls[-1] == ("end", None)
+    portfolio = calls[0][1][-1]
+    assert all(args[:-1] == ("BTC-USDT", "2026-11-03", "crypto") and args[-1] is portfolio
+               for name, args in calls if name != "end")
+    mandate = portfolio.render("BTC-USDT")
+    assert "opens a short" in mandate and "5 days" in mandate
     assert any(name == "clear" for name, _ in calls) == (not interrupted)
     assert "saved report" in db.get_job(conn, job["id"])["board"]
     assert db.get_job(conn, job["id"])["llm_calls"] == (2 if interrupted else 1)

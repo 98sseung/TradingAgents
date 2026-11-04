@@ -21,11 +21,28 @@ from tradingagents.agents.rating import run_rating
 from tradingagents.dataflows.files import locked
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.portfolio import PortfolioContext
 
 log = logging.getLogger("autotrader.worker")
 # The proposal and decision are rendered by tradingagents/agents/schemas.py as "**Stop Loss**: 2219.09".
 _LEVEL = r"\*\*{}\*\*:\s*\$?([0-9][0-9,]*\.?[0-9]*)"
 current = {"note": "idle"}  # what the heartbeat reports
+
+
+class TradingMandate(PortfolioContext):
+    def render(self, ticker: str) -> str:
+        return (
+            "Trading mandate (an automated execution layer acts on your rating):\n"
+            "- Venue: Binance USDT-margined perpetual futures, isolated margin, up to 3x leverage. "
+            "Long and short are equally available.\n"
+            "- Holding period: at most 5 days; positions are closed automatically after that. "
+            "Judge the next 1-5 days, not weeks or months.\n"
+            "- Rating -> action: Buy or Overweight opens a long; Sell opens a short; Hold and Underweight open nothing.\n"
+            "- A bearish view you would act on within 5 days must be rated Sell, not Underweight. "
+            "Use Hold or Underweight only when you would not open a position either way.\n"
+            "- Current holdings are not given here; the execution layer handles existing positions. "
+            "Stop loss and target must be prices for this 5-day trade."
+        )
 
 
 def level(text: str, label: str) -> float | None:
@@ -67,9 +84,11 @@ def run_job(conn, job) -> None:
     # Checkpointed, so a job requeued after a worker crash resumes at its last finished agent instead of re-paying for it.
     graph = TradingAgentsGraph(analysts, config={**DEFAULT_CONFIG, "checkpoint_enabled": True}, callbacks=[stats])
     run = (ticker, job["trade_date"], asset_type.value)
-    init_state = graph.create_run_state(*run)
+    portfolio = TradingMandate()
+    init_state = graph.create_run_state(*run, portfolio=portfolio)
     args = graph.propagator.get_graph_args(callbacks=[stats])
-    args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = graph.begin_checkpoint(*run)
+    args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = graph.begin_checkpoint(
+        *run, portfolio=portfolio)
 
     final_state: dict = {}
     try:
@@ -81,7 +100,7 @@ def run_job(conn, job) -> None:
                 raise RuntimeError("job ownership lost")
 
         graph.record_decision(ticker, job["trade_date"], final_state)
-        graph.clear_checkpoint_on_success(*run)
+        graph.clear_checkpoint_on_success(*run, portfolio=portfolio)
     finally:
         graph.end_checkpoint()
         db.update(conn, job["id"], owner=job["worker"], **stats.get_stats())
