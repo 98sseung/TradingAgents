@@ -2,7 +2,10 @@
 
 import logging
 import time
+from datetime import UTC, datetime
 from decimal import Decimal as D
+
+import yfinance as yf
 
 log = logging.getLogger(__name__)
 MIN_AGE, VOLUME_LIMIT, CANDIDATE_LIMIT = 90 * 86400, 20, 5
@@ -30,7 +33,25 @@ def _score(client, symbol, now):
     score = abs(emas[0] - emas[1]) / atr
     if not score.is_finite():
         raise ValueError("Invalid EMA spread")
-    return score
+    return score, closes[-1], bars[-1][6]
+
+
+def _yahoo_matches(symbol, close, closed_ms):
+    try:
+        history = yf.Ticker(symbol.removesuffix("USDT") + "-USD").history(
+            period="5d", interval="1d", raise_errors=True)
+        # Same UTC day as the completed Binance bar: Yahoo's last row is today's unfinished candle.
+        day = datetime.fromtimestamp(closed_ms / 1000, UTC).date()
+        same_day = [v for ts, v in history["Close"].dropna().items() if ts.date() == day]
+        if not same_day:
+            raise ValueError(f"No Yahoo daily close for {day}")
+        yahoo_close = D(str(same_day[0]))
+        if not yahoo_close.is_finite() or close <= 0 or abs(yahoo_close - close) > close * D("0.05"):
+            raise ValueError(f"Yahoo close {yahoo_close} differs from Binance close {close}")
+        return True
+    except Exception as exc:
+        log.warning("%s: Yahoo identity unavailable (%s: %s)", symbol, type(exc).__name__, exc)
+        return False
 
 
 def candidates(client):
@@ -55,7 +76,13 @@ def candidates(client):
         try:
             if "Meme" in item.get("underlyingSubType", []) or now * 1000 - item["onboardDate"] < MIN_AGE * 1000:
                 continue
-            ranked.append((_score(client, symbol, now), symbol))
+            ranked.append((*_score(client, symbol, now), symbol))
         except Exception as exc:
             log.warning("%s: trend unavailable (%s)", symbol, type(exc).__name__)
-    return [symbol for _, symbol in sorted(ranked, key=lambda row: (-row[0], row[1]))[:CANDIDATE_LIMIT]]
+    selected = []
+    for _, close, closed, symbol in sorted(ranked, key=lambda row: (-row[0], row[3])):
+        if _yahoo_matches(symbol, close, closed):
+            selected.append(symbol)
+            if len(selected) == CANDIDATE_LIMIT:
+                break
+    return selected

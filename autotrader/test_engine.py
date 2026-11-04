@@ -4,6 +4,7 @@ import time
 from datetime import UTC, datetime
 from decimal import Decimal as D
 
+import pandas as pd
 import pytest
 
 from autotrader import binance, db, engine, guard, scanner, trading
@@ -13,6 +14,13 @@ from autotrader.test_trading import FakeClient
 
 MIDNIGHT = datetime(2027, 1, 16, tzinfo=UTC).timestamp()
 NOW = MIDNIGHT + 300
+
+
+@pytest.fixture(autouse=True)
+def yahoo(monkeypatch):
+    history = pd.DataFrame({"Close": [1079]}, index=pd.to_datetime([NOW - 86400], unit="s", utc=True))
+    monkeypatch.setattr(scanner.yf.Ticker, "history", lambda *args, **kwargs: history)
+    return history
 
 
 class ScanClient:
@@ -53,7 +61,7 @@ def done(conn, ticker="BTC-USD", rating="Hold", source="engine"):
     return db.get_job(conn, job_id)
 
 
-def test_scanner_age_memes_and_completed_trend_ranking(monkeypatch):
+def test_scanner_age_memes_and_completed_trend_ranking(monkeypatch, yahoo):
     monkeypatch.setattr(time, "time", lambda: NOW)
     bases = ["LTC", "BTC", "SOL", "ETH", "XRP", "ADA", "LINK"]
     client = ScanClient([(base, 100 - i, i, 90) for i, base in enumerate(bases)])
@@ -63,12 +71,15 @@ def test_scanner_age_memes_and_completed_trend_ranking(monkeypatch):
     for item in symbols[-3:]:
         item["underlyingSubType"] = ["Meme", "Crypto"]
     monkeypatch.setattr(client, "symbols", lambda **kwargs: symbols)
+    monkeypatch.setattr(scanner.yf.Ticker, "history", lambda ticker, **kwargs:
+                        yahoo.assign(Close=1000 + 79 * bases.index(ticker.ticker.removesuffix("-USD"))))
     assert scanner.candidates(client) == [s + "USDT" for s in ("LINK", "ADA", "XRP", "ETH", "SOL")]
     assert set(client.requested) == {base + "USDT" for base, volume, slope, age in client.assets[:7]}
 
 
-def test_scanner_takes_top_volume_before_exclusions(monkeypatch):
+def test_scanner_takes_top_volume_before_exclusions(monkeypatch, yahoo):
     monkeypatch.setattr(time, "time", lambda: NOW)
+    yahoo["Close"] = 8900
     client = ScanClient([(f"NEW{i}", 1000 - i, 1, 1) for i in range(20)] + [("BTC", 1, 100, 100)])
     assert scanner.candidates(client) == [] and client.requested == []
     symbols = client.symbols()
@@ -77,6 +88,28 @@ def test_scanner_takes_top_volume_before_exclusions(monkeypatch):
     symbols[3]["marginAsset"], symbols[4]["contractType"] = "USDC", "CURRENT_QUARTER"
     monkeypatch.setattr(client, "symbols", lambda **kwargs: symbols)
     assert scanner.candidates(client) == ["BTCUSDT"]
+
+
+@pytest.mark.parametrize("bad_close", [1079 / 25, "1133", None, RuntimeError("Yahoo unavailable")])
+def test_scanner_yahoo_identity_rejects_and_backfills(monkeypatch, yahoo, bad_close, caplog):
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    monkeypatch.setattr(scanner, "CANDIDATE_LIMIT", 2)
+    client = ScanClient([(base, 100, 1, 100) for base in ("AIN", "BTC", "ETH", "SOL")])
+    calls = []
+
+    def history(ticker, **kwargs):
+        calls.append(ticker.ticker)
+        if ticker.ticker == "AIN-USD":
+            if isinstance(bad_close, Exception):
+                raise bad_close
+            return yahoo.iloc[:0] if bad_close is None else yahoo.assign(Close=bad_close)
+        return yahoo.assign(Close="1132.95")  # Exactly 5% above the completed Binance close.
+
+    monkeypatch.setattr(scanner.yf.Ticker, "history", history)
+    assert scanner.candidates(client) == ["BTCUSDT", "ETHUSDT"]
+    assert calls == ["AIN-USD", "BTC-USD", "ETH-USD"]
+    assert client.requested == ["AINUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    assert "AINUSDT: Yahoo identity unavailable" in caplog.text
 
 
 def test_symbols_uses_the_exchange_cache(monkeypatch):
