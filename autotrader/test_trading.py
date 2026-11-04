@@ -34,7 +34,7 @@ class FakeClient:
         return [[0, str(c), str(c + 2), str(c - 2), str(c), "1", NOW * 1000 - 1] for c in self.closes]
 
     def ensure_setup(self, symbol, leverage):
-        assert leverage == 3
+        assert leverage == 5
 
     def order_by_client_id(self, symbol, client_id, *, algo=False):
         if client_id not in self.orders:
@@ -212,7 +212,7 @@ def test_stop_target_rules(env, rating, stop, target, want_stop, want_target):
 def test_sizing(env):
     conn, client = env
     client.price, client.wallet = D(60000), D(100)
-    assert D(decision(conn, client)["qty"]) == D("0.001")
+    assert D(decision(conn, client)["qty"]) == D("0.002")  # $100 x 30% x 5 = $150 at 60k, step 0.001
 
 
 @pytest.mark.parametrize("rating", ["Buy", "Sell"])

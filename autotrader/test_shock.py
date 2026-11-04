@@ -120,7 +120,7 @@ def test_stop_beyond_liquidation_distance_blocks_entry(env):
     conn, client, clock, prices = env
     j = job(conn, "Buy", source="shock", shock=json.dumps({"direction": 1, "atr": 20, "detected_at": NOW, "price": 100}))  # 1.5 ATR = 30% at mark 100
     db.update(conn, j["id"], finished_at=NOW)
-    assert trading._evaluate(conn, client, db.get_job(conn, j["id"]))["reason"] == "Stop too far for 3x leverage"
+    assert trading._evaluate(conn, client, db.get_job(conn, j["id"]))["reason"] == "Stop too far for 5x leverage"
 
 
 @pytest.mark.parametrize("age,move,reason", [(1801, 0, "Shock too old"), (1800, 3, "Price moved away from shock")])

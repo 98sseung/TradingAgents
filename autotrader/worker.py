@@ -38,7 +38,7 @@ class TradingMandate(PortfolioContext):
     def render(self, ticker: str) -> str:
         return (
             "Trading mandate (an automated execution layer acts on your rating):\n"
-            "- Venue: Binance USDT-margined perpetual futures, isolated margin, up to 3x leverage. "
+            f"- Venue: Binance USDT-margined perpetual futures, isolated margin, up to {trading.LEVERAGE}x leverage. "
             "Long and short are equally available.\n"
             "- Holding period: at most 5 days; positions are closed automatically after that. "
             "Judge the next 1-5 days, not weeks or months.\n"
