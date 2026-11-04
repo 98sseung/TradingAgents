@@ -74,22 +74,24 @@ def test_scanner_age_memes_and_completed_trend_ranking(monkeypatch, yahoo):
     monkeypatch.setattr(scanner.yf.Ticker, "history", lambda ticker, **kwargs:
                         yahoo.assign(Close=1000 + 79 * bases.index(ticker.ticker.removesuffix("-USD"))))
     selected, eligible = scanner.candidates(client)
-    assert selected == [s + "USDT" for s in ("LINK", "ADA", "XRP", "ETH", "SOL")]
+    assert list(selected) == [s + "USDT" for s in ("LINK", "ADA", "XRP", "ETH", "SOL")]
     assert eligible == [base + "USDT" for base in bases]
+    assert selected["LINKUSDT"] == {"direction": 1, "atr": 7, "price": 1474}
     assert set(client.requested) == {base + "USDT" for base, volume, slope, age in client.assets[:7]}
+    assert scanner._score(ScanClient([("BTC", 100, -1, 100)]), "BTCUSDT", NOW)[-2:] == (-1, 2)
 
 
 def test_scanner_takes_top_volume_before_exclusions(monkeypatch, yahoo):
     monkeypatch.setattr(time, "time", lambda: NOW)
     yahoo["Close"] = 8900
     client = ScanClient([(f"NEW{i}", 1000 - i, 1, 1) for i in range(20)] + [("BTC", 1, 100, 100)])
-    assert scanner.candidates(client)[0] == [] and client.requested == []
+    assert not scanner.candidates(client)[0] and client.requested == []
     symbols = client.symbols()
     for item in symbols[:3]:
         item["status"] = "SETTLING"
     symbols[3]["marginAsset"], symbols[4]["contractType"] = "USDC", "CURRENT_QUARTER"
     monkeypatch.setattr(client, "symbols", lambda **kwargs: symbols)
-    assert scanner.candidates(client)[0] == ["BTCUSDT"]
+    assert list(scanner.candidates(client)[0]) == ["BTCUSDT"]
 
 
 @pytest.mark.parametrize("bad_close", [1079 / 25, "1133", None, RuntimeError("Yahoo unavailable")])
@@ -108,7 +110,7 @@ def test_scanner_yahoo_identity_rejects_and_backfills(monkeypatch, yahoo, bad_cl
         return yahoo.assign(Close="1132.95")  # Exactly 5% above the completed Binance close.
 
     monkeypatch.setattr(scanner.yf.Ticker, "history", history)
-    assert scanner.candidates(client)[0] == ["BTCUSDT", "ETHUSDT"]
+    assert list(scanner.candidates(client)[0]) == ["BTCUSDT", "ETHUSDT"]
     assert calls == ["AIN-USD", "BTC-USD", "ETH-USD"]
     assert client.requested == ["AINUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT"]
     assert "AINUSDT: Yahoo identity unavailable" in caplog.text
@@ -134,7 +136,7 @@ def test_symbols_uses_the_exchange_cache(monkeypatch):
 def test_daily_scan_once_per_day_and_deduplicates(env, monkeypatch):
     conn, client, clock = env
     calls = []
-    monkeypatch.setattr(scanner, "candidates", lambda client: calls.append(clock[0]) or (["BTCUSDT"], ["BTCUSDT"]))
+    monkeypatch.setattr(scanner, "candidates", lambda client: calls.append(clock[0]) or ({"BTCUSDT": {"direction": 1, "atr": 4, "price": 100}}, ["BTCUSDT"]))
     clock[0] = MIDNIGHT + 299
     engine.step(conn, client, clock[0])
     assert calls == []
@@ -154,12 +156,16 @@ def test_budget_counts_failed_engine_jobs_not_manual_and_warns_once(env, monkeyp
     db.update(conn, done(conn, "BAD-USD")["id"], status="failed")
     done(conn, source="manual")
     monkeypatch.setattr(engine, "DAILY_BUDGET", 2)
-    monkeypatch.setattr(scanner, "candidates", lambda client: (["BTCUSDT", "ETHUSDT", "SOLUSDT"], []))
+    monkeypatch.setattr(scanner, "candidates", lambda client: ({s: {"direction": 1, "atr": 4, "price": 100} for s in ("BTCUSDT", "ETHUSDT", "SOLUSDT")}, []))
     engine.step(conn, client, clock[0])
     trading._set(conn, "engine_scan_date", "")
     engine.step(conn, client, clock[0])
     assert conn.execute("SELECT COUNT(*) FROM jobs WHERE source = 'engine'").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM events WHERE message LIKE '%budget%'").fetchone()[0] == 1
+    rows = conn.execute("SELECT * FROM candidates ORDER BY id LIMIT 3").fetchall()
+    assert len(rows) == 3 and rows[0]["job_id"] is not None
+    assert all(r["job_id"] is None and r["skip_reason"] == "Daily analysis budget exhausted" for r in rows[1:])
+    assert all((r["at"], r["direction"], r["atr"], r["price"], r["kind"]) == (NOW, 1, 4, 100, "daily") for r in rows)
 
 
 def test_manual_never_decided_and_engine_decided_once(env):
@@ -176,12 +182,12 @@ def test_entry_waits_for_guard_then_resumes_same_decision(env, age):
     conn, client, clock = env
     done(conn, rating="Buy")
     if age is not None:
-        db.beat(conn, "guard")
+        db.beat(conn, "guard", "monitoring")
         conn.execute("UPDATE heartbeat SET at = ? WHERE name = 'guard'", (clock[0] - age,))
     engine.step(conn, client, clock[0])
     engine.step(conn, client, clock[0])
     assert not client.posts and conn.execute("SELECT COUNT(*) FROM events WHERE level = 'warn'").fetchone()[0] == 1
-    db.beat(conn, "guard")
+    db.beat(conn, "guard", "monitoring")
     engine.step(conn, client, clock[0])
     engine.step(conn, client, clock[0])
     assert client.posts == ["tb1in", "tb1sl", "tb1tp"]
@@ -201,7 +207,7 @@ def test_failing_job_and_existing_decision_survive_restart(env, monkeypatch):
         return decide(conn, client, job)
 
     monkeypatch.setattr(trading, "decide", failing)
-    db.beat(conn, "guard")
+    db.beat(conn, "guard", "monitoring")
     client.crash = True
     with pytest.raises(SystemExit):
         engine.step(conn, client, clock[0])
@@ -279,6 +285,7 @@ def test_scan_retry_does_not_requeue_finished_holdings_and_closes_ignore_stale_g
     clock[0] += 30
     engine.step(conn, client, clock[0])
     assert conn.execute("SELECT COUNT(*) FROM jobs WHERE source = 'engine'").fetchone()[0] == 1
+    assert not conn.execute("SELECT 1 FROM candidates").fetchone()
     done(conn, rating="Sell")
     engine.step(conn, client, clock[0])
     assert not client.held and client.posts[-1].endswith("out")
@@ -307,7 +314,7 @@ def test_scanner_uses_classification_not_asset_names(monkeypatch):
         symbol["underlyingType"] = kind
         symbol["contractType"] = "TRADIFI_PERPETUAL"
     monkeypatch.setattr(client, "symbols", lambda **kwargs: symbols)
-    assert scanner.candidates(client)[0] == ["DOGEUSDT"]
+    assert list(scanner.candidates(client)[0]) == ["DOGEUSDT"]
 
 
 def test_scanner_uses_live_metadata_but_venue_tradability(monkeypatch):
@@ -323,7 +330,7 @@ def test_scanner_uses_live_metadata_but_venue_tradability(monkeypatch):
         item["underlyingSubType"] = ["Meme", "Crypto"]
     metadata[3]["onboardDate"] = (NOW - 86400) * 1000
     monkeypatch.setattr(client, "symbols", lambda *, live=False: metadata if live else venue)
-    assert scanner.candidates(client)[0] == ["BTCUSDT"]
+    assert list(scanner.candidates(client)[0]) == ["BTCUSDT"]
     assert client.requested == ["BTCUSDT"]
 
 
@@ -342,7 +349,7 @@ def test_execution_failure_is_bounded_and_does_not_block_later_decisions(env, mo
 
     monkeypatch.setattr(trading, "execute", failing)
     for _ in range(4):
-        db.beat(conn, "guard")
+        db.beat(conn, "guard", "monitoring")
         engine.step(conn, client, clock[0])
         clock[0] += 30
     rows = conn.execute("SELECT * FROM decisions ORDER BY id").fetchall()
@@ -350,3 +357,23 @@ def test_execution_failure_is_bounded_and_does_not_block_later_decisions(env, mo
     assert rows[1]["job_id"] == good["id"] and rows[1]["executed_at"] is not None
     assert conn.execute("SELECT COUNT(*) FROM events WHERE level = 'error'").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM events WHERE message LIKE '%gave up%'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("task,interval", [("reconcile", 30), ("close_expired", 300)])
+def test_guard_failed_task_stays_unhealthy_until_retry(env, monkeypatch, task, interval):
+    conn, client, clock = env
+    done(conn, rating="Buy")
+    def fail(conn, client):
+        raise ValueError("check failed")
+    monkeypatch.setattr(trading, task, fail)
+    for elapsed in (0, 5):
+        clock[0] = NOW + elapsed
+        guard.step(conn, client, clock[0])
+        assert db.heartbeat(conn, "guard")["note"] == "checks failed"
+        engine._jobs(conn, client, clock[0])
+        assert not client.posts
+    monkeypatch.setattr(trading, task, lambda *args: None)
+    clock[0] = NOW + interval
+    guard.step(conn, client, clock[0])
+    engine._jobs(conn, client, clock[0])
+    assert db.heartbeat(conn, "guard")["note"] == "monitoring" and len(client.posts) == 3

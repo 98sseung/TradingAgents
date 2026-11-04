@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, at REAL NOT NULL, level TEXT NOT NULL, source TEXT NOT NULL,
     message TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS candidates (
+    id INTEGER PRIMARY KEY, at REAL, symbol TEXT, kind TEXT CHECK (kind IN ('daily', 'shock')),
+    direction INTEGER CHECK (direction IN (1, -1)), atr REAL, price REAL,
+    job_id INTEGER, skip_reason TEXT, mech_now REAL, mech_delay REAL, scored_at REAL
+);
 CREATE TABLE IF NOT EXISTS outcomes (
     job_id INTEGER, horizon_h INTEGER, symbol TEXT, rating TEXT, entry TEXT, exit TEXT,
     ret_pct REAL, verdict TEXT, scored_at REAL, PRIMARY KEY (job_id, horizon_h)

@@ -90,7 +90,7 @@ def env(tmp_path, monkeypatch):
 
 def job(conn, rating="Buy", **fields):
     job_id = db.enqueue(conn, "BTC-USD", "2027-01-15", ["market"])
-    db.update(conn, job_id, status="done", rating=rating, finished_at=NOW, **fields)
+    db.update(conn, job_id, status="done", rating=rating, finished_at=t.time.time(), **fields)
     return db.get_job(conn, job_id)
 
 
@@ -466,3 +466,14 @@ def test_income_window_uses_exchange_fill_time(env, monkeypatch):
     t.flatten_all(conn, client, "manual")
     row = conn.execute("SELECT * FROM trades").fetchone()
     assert row["closed_at"] == NOW + 2 and D(row["realized_pnl"]) == D(36)
+
+
+def test_stale_analysis_cannot_close_even_after_decision(env, monkeypatch):
+    conn, client = env
+    opened(env)
+    j = job(conn, "Sell")
+    key = t.decide(conn, client, j)
+    monkeypatch.setattr(t.time, "time", lambda: NOW + t.MAX_AGE + 1)
+    assert t._evaluate(conn, client, j)["action"] == "none"
+    t.execute(conn, client, key)
+    assert client.held and len(client.posts) == 3

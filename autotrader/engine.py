@@ -31,16 +31,25 @@ def _enqueue(conn, symbol, today, midnight, *, daily=False):
     if daily and conn.execute("SELECT 1 FROM jobs WHERE source = 'engine' AND ticker = ? "
                               "AND created_at >= ? AND created_at < ?",
                               (ticker, midnight, midnight + 86400)).fetchone():
-        return
+        return None, "Daily analysis already queued"
     queued = conn.execute("SELECT 1 FROM jobs WHERE source = 'engine' AND ticker = ? "
                           "AND status IN ('queued', 'running')", (ticker,)).fetchone()
     count = _budget_count(conn, midnight)
-    if not queued and count >= DAILY_BUDGET:
+    if queued:
+        return None, "Analysis already queued or running"
+    if count >= DAILY_BUDGET:
         if trading._get(conn, "engine_budget_date") != today:
             _event(conn, "warn", "Daily analysis budget exhausted")
             trading._set(conn, "engine_budget_date", today)
-    elif not queued:
-        db.enqueue(conn, ticker, today, ANALYSTS, source="engine")
+        return None, "Daily analysis budget exhausted"
+    return db.enqueue(conn, ticker, today, ANALYSTS, source="engine"), None
+
+
+def _candidate(conn, now, symbol, kind, direction, atr, price, skip_reason=None):
+    return conn.execute(
+        "INSERT INTO candidates (at, symbol, kind, direction, atr, price, skip_reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (now, symbol, kind, direction, float(atr), float(price), skip_reason),
+    ).lastrowid
 
 
 def _four_hour(client, symbol, now):
@@ -67,7 +76,14 @@ def _shocks(conn, client, now, today, midnight):
             _event(conn, "error", f"{symbol}: shock check failed ({type(exc).__name__})")
     if not crossings:
         return
-    _, symbol, ratio, atr, price = max(crossings)
+    chosen = max(crossings)
+    for crossing in crossings:
+        _, symbol, ratio, atr, price = crossing
+        candidate_id = _candidate(conn, now, symbol, "shock", 1 if ratio > 0 else -1, atr, price,
+                                  None if crossing == chosen else "smaller crossing in same check")
+        if crossing == chosen:
+            key = candidate_id
+    _, symbol, ratio, atr, price = chosen
     ticker = symbol.removesuffix("USDT") + "-USD"
     try:
         positions = {p["symbol"] for p in client.positions()}
@@ -83,21 +99,25 @@ def _shocks(conn, client, now, today, midnight):
             (len(positions) >= trading.MAX_POSITIONS, "Maximum open positions"),
             (_budget_count(conn, midnight) >= DAILY_BUDGET, "Daily analysis budget exhausted"),
         ]
-        for blocked, reason in gates:
-            if blocked:
-                _event(conn, "info", f"{symbol}: shock skipped: {reason}")
-                return
-        daily = [b for b in client.klines(symbol, "1d", 100) if b[6] < now * 1000][-1]
-        if not scanner._yahoo_matches(symbol, D(daily[4]), daily[6]):
-            _event(conn, "info", f"{symbol}: shock skipped: Yahoo identity mismatch")
+        reason = next((reason for blocked, reason in gates if blocked), None)
+        if reason is None:
+            daily = [b for b in client.klines(symbol, "1d", 100) if b[6] < now * 1000][-1]
+            if not scanner._yahoo_matches(symbol, D(daily[4]), daily[6]):
+                reason = "Yahoo identity mismatch"
+        if reason:
+            conn.execute("UPDATE candidates SET skip_reason = ? WHERE id = ?", (reason, key))
+            _event(conn, "info", f"{symbol}: shock skipped: {reason}")
             return
         btc_price, btc_previous = _four_hour(client, "BTCUSDT", now)
         facts = {"direction": 1 if ratio > 0 else -1, "atr": float(atr), "ratio": float(ratio),
                  "detected_at": now, "price": float(price),
                  "btc_move_pct": float((btc_price / btc_previous - 1) * 100)}
-        db.enqueue(conn, ticker, today, ANALYSTS, source="shock", shock=json.dumps(facts))
+        job_id = db.enqueue(conn, ticker, today, ANALYSTS, source="shock", shock=json.dumps(facts))
+        conn.execute("UPDATE candidates SET job_id = ? WHERE id = ?", (job_id, key))
     except Exception as exc:
-        _event(conn, "error", f"{symbol}: shock enqueue failed ({type(exc).__name__})")
+        reason = f"shock enqueue failed ({type(exc).__name__})"
+        conn.execute("UPDATE candidates SET skip_reason = ? WHERE id = ?", (reason, key))
+        _event(conn, "error", f"{symbol}: {reason}")
 
 
 def _jobs(conn, client, now):
@@ -118,7 +138,7 @@ def _jobs(conn, client, now):
                 recovering = trading._get(conn, f"tb{key}in") is not None
                 heartbeat = db.heartbeat(conn, "guard")
                 age = max(now, time.time()) - heartbeat["at"] if heartbeat else GUARD_AGE
-                if not recovering and not 0 <= age < GUARD_AGE:
+                if not recovering and not (0 <= age < GUARD_AGE and heartbeat["note"] == "monitoring"):
                     message = f"Decision {key}: entry waiting for a fresh Risk Guard heartbeat"
                     if not conn.execute("SELECT 1 FROM events WHERE source = 'engine' AND message = ?",
                                         (message,)).fetchone():
@@ -150,14 +170,22 @@ def step(conn, client, now):
             trading._set(conn, "engine_universe", json.dumps(eligible))
             _event(conn, "info", "Daily scan: " + (", ".join(selected) or "none"))
         except Exception as exc:
-            selected, scanned = [], False
+            selected, scanned = {}, False
             _event(conn, "error", f"Daily scan failed ({type(exc).__name__})")
-        for symbol in dict.fromkeys(symbols + selected):
+        for symbol in dict.fromkeys(symbols + list(selected)):
+            key = None
+            if symbol in selected:
+                key = _candidate(conn, now, symbol, "daily", **selected[symbol])
             try:
-                _enqueue(conn, symbol, today, midnight, daily=True)
+                job_id, reason = _enqueue(conn, symbol, today, midnight, daily=True)
+                if key is not None:
+                    conn.execute("UPDATE candidates SET job_id = ?, skip_reason = ? WHERE id = ?", (job_id, reason, key))
             except Exception as exc:
                 scanned = False
-                _event(conn, "error", f"{symbol}: enqueue failed ({type(exc).__name__})")
+                reason = f"enqueue failed ({type(exc).__name__})"
+                if key is not None:
+                    conn.execute("UPDATE candidates SET skip_reason = ? WHERE id = ?", (reason, key))
+                _event(conn, "error", f"{symbol}: {reason}")
         if scanned:
             trading._set(conn, "engine_scan_date", today)
     if now - float(trading._get(conn, "engine_event_at", "-inf")) >= EVENT_INTERVAL:

@@ -42,6 +42,10 @@ def test_crossing_once_largest_and_shared_budget(env, monkeypatch):
     row = db.recent_jobs(conn)[0]
     assert (row["ticker"], row["source"]) == ("ETH-USD", "shock")
     assert json.loads(row["shock"]) == {"direction": 1, "atr": 2, "ratio": 2, "price": 104, "detected_at": clock[0], "btc_move_pct": 1}
+    candidates = conn.execute("SELECT * FROM candidates ORDER BY id").fetchall()
+    assert [(r["symbol"], r["job_id"], r["skip_reason"]) for r in candidates] == [
+        ("SOLUSDT", None, "smaller crossing in same check"), ("ETHUSDT", row["id"], None)]
+    assert all((r["kind"], r["direction"], r["atr"], r["at"]) == ("shock", 1, 2, clock[0]) for r in candidates)
     clock[0] += 300
     engine.step(conn, client, clock[0])
     assert len(db.recent_jobs(conn)) == 1
@@ -73,6 +77,8 @@ def test_detection_skip_reasons(env, monkeypatch, gate, reason):
         monkeypatch.setattr(scanner, "_yahoo_matches", lambda *args: False)
     engine._shocks(conn, client, NOW, "2027-01-16", MIDNIGHT)
     assert reason in conn.execute("SELECT message FROM events WHERE level = 'info'").fetchone()[0]
+    candidate = conn.execute("SELECT * FROM candidates").fetchone()
+    assert candidate["job_id"] is None and reason in candidate["skip_reason"]
     assert not conn.execute("SELECT 1 FROM jobs WHERE shock IS NOT NULL").fetchone()
 
 
@@ -80,7 +86,7 @@ def test_detection_skip_reasons(env, monkeypatch, gate, reason):
     (-1, "Sell", "open_short"), (1, "Sell", "none"), (-1, "Buy", "none"), (1, "Hold", "none")])
 def test_veto_fixed_levels_and_recheck(env, direction, rating, action):
     conn, client, clock, prices = env
-    j = job(conn, rating, source="shock", shock=json.dumps({"direction": direction, "atr": 4}), stop_loss=99, price_target=101)
+    j = job(conn, rating, source="shock", shock=json.dumps({"direction": direction, "atr": 4, "detected_at": NOW, "price": 100}), stop_loss=99, price_target=101)
     db.update(conn, j["id"], finished_at=NOW)
     row = trading._evaluate(conn, client, db.get_job(conn, j["id"]))
     assert row["action"] == action
@@ -88,7 +94,7 @@ def test_veto_fixed_levels_and_recheck(env, direction, rating, action):
         assert row["reason"] == "LLM veto: rating disagrees with shock"
         return
     assert (row["stop"], row["target"]) == (100 - direction * 6, 100 + direction * 12)
-    db.beat(conn, "guard")
+    db.beat(conn, "guard", "monitoring")
     engine._jobs(conn, client, NOW)
     assert conn.execute("SELECT stop,target FROM trades").fetchone()[:] == (str(row["stop"]), str(row["target"]))
     flip = {**dict(j), "source": "engine", "shock": None, "rating": "Sell" if direction > 0 else "Buy"}
@@ -105,20 +111,25 @@ def test_veto_fixed_levels_and_recheck(env, direction, rating, action):
 
 @pytest.mark.parametrize("direction,high,low,close,result", [(1, 112, 99, 100, 3), (1, 112, 94, 100, -1.5),
     (1, 103, 97, 102, .5), (-1, 101, 88, 100, 3), (-1, 106, 88, 100, -1.5), (-1, 103, 97, 98, .5)])
-def test_mechanical_scoring(env, monkeypatch, direction, high, low, close, result):
-    conn, client, clock, prices = env
-    j = job(conn, "Hold" if direction == 1 else "Sell", source="shock", shock=json.dumps({"direction": direction, "atr": 4}))
-    start = int(NOW // 3600) * 3600000
-    bars = [[t, "100", str(high), str(low), str(close), 1, t + 3599999] for i in range(120) for t in [start + i * 3600000]]
-    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: bars, raising=False)
-    db.update(conn, j["id"], finished_at=NOW)
-    assert feedback.score(conn, client, NOW + 120 * 3600) == 2
-    assert conn.execute("SELECT mech_atr FROM outcomes WHERE horizon_h = 120").fetchone()[0] == pytest.approx(result - .025)
-    assert conn.execute("SELECT mech_atr FROM outcomes WHERE horizon_h = 24").fetchone()[0] is None
+def test_mechanical_scoring(direction, high, low, close, result):
+    bars = [[0, "100", str(high), str(low), str(close), 1, 3599999]]
+    assert feedback._mechanical({"direction": direction, "atr": 4}, bars, D(100), D(close)) == pytest.approx(result - .025)
 
 
 def test_stop_beyond_liquidation_distance_blocks_entry(env):
     conn, client, clock, prices = env
-    j = job(conn, "Buy", source="shock", shock=json.dumps({"direction": 1, "atr": 20}))  # 1.5 ATR = 30% at mark 100
+    j = job(conn, "Buy", source="shock", shock=json.dumps({"direction": 1, "atr": 20, "detected_at": NOW, "price": 100}))  # 1.5 ATR = 30% at mark 100
     db.update(conn, j["id"], finished_at=NOW)
     assert trading._evaluate(conn, client, db.get_job(conn, j["id"]))["reason"] == "Stop too far for 3x leverage"
+
+
+@pytest.mark.parametrize("age,move,reason", [(1801, 0, "Shock too old"), (1800, 3, "Price moved away from shock")])
+def test_shock_freshness_rechecked_at_execution(env, age, move, reason):
+    conn, client, clock, prices = env
+    j = job(conn, source="shock", shock=json.dumps({"direction": 1, "atr": 4, "detected_at": NOW, "price": 100}))
+    db.update(conn, j["id"], finished_at=NOW)
+    key = trading.decide(conn, client, db.get_job(conn, j["id"]))
+    clock[0], client.price = NOW + age, D(100 + move)
+    trading.execute(conn, client, key)
+    assert not client.posts
+    assert reason in conn.execute("SELECT message FROM events ORDER BY id DESC LIMIT 1").fetchone()[0]

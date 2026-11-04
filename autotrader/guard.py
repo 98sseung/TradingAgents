@@ -15,7 +15,7 @@ def _equity(conn, client):
 
 
 def step(conn, client, now):
-    healthy, failed = True, False
+    healthy = True
     tasks = [("limits", 0, trading.check_limits), ("equity", 0, _equity),
              ("reconcile", RECONCILE_INTERVAL, trading.reconcile),
              ("expiry", EXPIRY_INTERVAL, trading.close_expired)]
@@ -27,11 +27,13 @@ def step(conn, client, now):
             trading._set(conn, key, now)
         try:
             run(conn, client)
+            trading._set(conn, "guard_" + name + "_ok", "1")
         except Exception as exc:
-            failed = True
+            trading._set(conn, "guard_" + name + "_ok", "0")
             healthy = healthy and bool(interval)
             conn.execute("INSERT INTO events (at, level, source, message) VALUES (?, 'error', 'guard', ?)",
                          (now, f"{name} failed ({type(exc).__name__})"))
+    failed = any(trading._get(conn, "guard_" + name + "_ok") != "1" for name, _, _ in tasks)
     note = "checks failed" if failed else "monitoring"
     if healthy:
         db.beat(conn, "guard", note)

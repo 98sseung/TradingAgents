@@ -36,6 +36,8 @@ def test_levels_are_read_from_rendered_proposals():
     assert level(plan, "Stop Loss") == 2219.09
     assert level(plan, "Entry Price") is None
     assert level("**Price Target**: $78,250.5", "Price Target") == 78250.5
+    assert level("**Stop Loss**: 1e-05", "Stop Loss") == 0.00001
+    assert level("**Stop Loss**: $7,825.05E+2", "Stop Loss") == 782505
     assert level("", "Stop Loss") is None
 
 

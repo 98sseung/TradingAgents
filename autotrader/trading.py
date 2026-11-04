@@ -104,12 +104,19 @@ def _indicators(client, symbol):
     return rsi, atr
 
 
+def _fresh(job):
+    return (job["status"] == "done" and job["finished_at"] is not None
+            and 0 <= time.time() - job["finished_at"] <= MAX_AGE)
+
+
 def _evaluate(conn, client, job):
     job = dict(job)
     rating, mark, qty, stop, target = job.get("rating") or "", None, None, None, None
     action, reason, symbol = "none", "Rating does not request entry", job["ticker"]
     try:
         symbol = symbol_for(symbol)
+        if not _fresh(job):
+            raise ValueError("Stale or unfinished analysis")
         shock = json.loads(job["shock"]) if job.get("source") == "shock" else None
         if shock and rating not in (("Buy", "Overweight") if shock["direction"] == 1 else ("Sell",)):
             raise ValueError("LLM veto: rating disagrees with shock")
@@ -139,17 +146,15 @@ def _evaluate(conn, client, job):
                 (symbol in tracked, "Ledger requires reconciliation"),
                 (len(tracked | {p["symbol"] for p in positions}) >= MAX_POSITIONS, "Maximum open positions"),
                 (time.time() < float(_get(conn, "cooldown:" + symbol, 0)), "Stop cooldown"),
-                (
-                    job.get("status") != "done"
-                    or not job.get("finished_at")
-                    or not 0 <= time.time() - job["finished_at"] <= MAX_AGE,
-                    "Stale or unfinished analysis",
-                ),
             ]
             for blocked, message in gates:
                 if blocked:
                     raise ValueError(message)
             if shock:
+                if time.time() - shock["detected_at"] > 30 * 60:
+                    raise ValueError("Shock too old")
+                if abs(mark - D(str(shock["price"]))) > D("0.5") * D(str(shock["atr"])):
+                    raise ValueError("Price moved away from shock")
                 if _shock_open(conn):
                     raise ValueError("Shock-origin position open")
                 sides = {r["symbol"]: 1 if r["side"] == "LONG" else -1
@@ -442,6 +447,10 @@ def execute(conn, client, decision_id):
     if trade and trade["status"] == "closed":
         return
     if action == "close":
+        job = conn.execute("SELECT * FROM jobs WHERE id = ?", (decision["job_id"],)).fetchone()
+        if job is not None and not _fresh(job):
+            _event(conn, "warn", symbol + ": close blocked during execution recheck: Stale or unfinished analysis")
+            return
         trade = _trade(conn, symbol)
         if trade and trade["opened_at"] <= decision["created_at"]:
             _close(conn, client, dict(trade), decision_id, "rating")

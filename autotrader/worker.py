@@ -28,7 +28,7 @@ from tradingagents.portfolio import PortfolioContext
 
 log = logging.getLogger("autotrader.worker")
 # The proposal and decision are rendered by tradingagents/agents/schemas.py as "**Stop Loss**: 2219.09".
-_LEVEL = r"\*\*{}\*\*:\s*\$?([0-9][0-9,]*\.?[0-9]*)"
+_LEVEL = r"\*\*{}\*\*:\s*\$?([0-9][0-9,]*\.?[0-9]*(?:[eE][+-]?[0-9]+)?)"
 current = {"note": "idle"}  # what the heartbeat reports
 
 

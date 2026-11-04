@@ -33,7 +33,7 @@ def _score(client, symbol, now):
     score = abs(emas[0] - emas[1]) / atr
     if not score.is_finite():
         raise ValueError("Invalid EMA spread")
-    return score, closes[-1], bars[-1][6]
+    return score, closes[-1], bars[-1][6], 1 if emas[0] >= emas[1] else -1, atr
 
 
 def _yahoo_matches(symbol, close, closed_ms):
@@ -55,7 +55,7 @@ def _yahoo_matches(symbol, close, closed_ms):
 
 
 def candidates(client):
-    """Return the Yahoo-checked top picks and the full eligible shock universe."""
+    """Return top picks with frozen daily inputs and the full eligible shock universe."""
     now = time.time()
     volumes = {}
     for ticker in client.tickers():
@@ -80,10 +80,10 @@ def candidates(client):
             ranked.append((*_score(client, symbol, now), symbol))
         except Exception as exc:
             log.warning("%s: trend unavailable (%s)", symbol, type(exc).__name__)
-    selected = []
-    for _, close, closed, symbol in sorted(ranked, key=lambda row: (-row[0], row[3])):
+    selected = {}
+    for _, close, closed, direction, atr, symbol in sorted(ranked, key=lambda row: (-row[0], row[-1])):
         if _yahoo_matches(symbol, close, closed):
-            selected.append(symbol)
+            selected[symbol] = {"direction": direction, "atr": float(atr), "price": float(close)}
             if len(selected) == CANDIDATE_LIMIT:
                 break
-    return selected, [row[3] for row in ranked]
+    return selected, [row[-1] for row in ranked]
