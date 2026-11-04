@@ -61,59 +61,52 @@ def done(conn, ticker="BTC-USD", rating="Hold", source="engine"):
     return db.get_job(conn, job_id)
 
 
-def test_scanner_age_memes_and_completed_trend_ranking(monkeypatch, yahoo):
+def test_scanner_fixed_universe_and_completed_trend_ranking(monkeypatch, yahoo):
     monkeypatch.setattr(time, "time", lambda: NOW)
-    bases = ["LTC", "BTC", "SOL", "ETH", "XRP", "ADA", "LINK"]
-    client = ScanClient([(base, 100 - i, i, 90) for i, base in enumerate(bases)])
-    client.assets += [(base, 1000, 99, age) for base, age in [("NEW", 89), ("DOGE", 100),
-                                                            ("1000PEPE", 100), ("1000000SHIB", 100)]]
-    symbols = client.symbols()
-    for item in symbols[-3:]:
-        item["underlyingSubType"] = ["Meme", "Crypto"]
-    monkeypatch.setattr(client, "symbols", lambda **kwargs: symbols)
+    bases = ["BTC", "ETH", "XRP", "SOL", "LINK"]
+    client = ScanClient([(base, 100, i, 1) for i, base in enumerate(bases)] + [("LTC", 10**12, 99, 100)])
+    monkeypatch.setattr(client, "tickers", lambda: pytest.fail("Scanner must not fetch tickers"))
     monkeypatch.setattr(scanner.yf.Ticker, "history", lambda ticker, **kwargs:
                         yahoo.assign(Close=1000 + 79 * bases.index(ticker.ticker.removesuffix("-USD"))))
     selected, eligible = scanner.candidates(client)
-    assert list(selected) == [s + "USDT" for s in ("LINK", "ADA", "XRP", "ETH", "SOL")]
+    assert list(selected) == [base + "USDT" for base in reversed(bases)]
     assert eligible == [base + "USDT" for base in bases]
-    assert selected["LINKUSDT"] == {"direction": 1, "atr": 7, "price": 1474}
-    assert set(client.requested) == {base + "USDT" for base, volume, slope, age in client.assets[:7]}
+    assert selected["LINKUSDT"] == {"direction": 1, "atr": 5.0, "price": 1316.0}
+    assert all(isinstance(facts["atr"], float) and isinstance(facts["price"], float) for facts in selected.values())
+    assert client.requested == eligible
     assert scanner._score(ScanClient([("BTC", 100, -1, 100)]), "BTCUSDT", NOW)[-2:] == (-1, 2)
 
 
-def test_scanner_takes_top_volume_before_exclusions(monkeypatch, yahoo):
+def test_scanner_skips_non_trading_universe_symbols(monkeypatch):
     monkeypatch.setattr(time, "time", lambda: NOW)
-    yahoo["Close"] = 8900
-    client = ScanClient([(f"NEW{i}", 1000 - i, 1, 1) for i in range(20)] + [("BTC", 1, 100, 100)])
-    assert not scanner.candidates(client)[0] and client.requested == []
+    client = ScanClient([(base, 100, 1, 100) for base in ("BTC", "ETH")])
     symbols = client.symbols()
-    for item in symbols[:3]:
-        item["status"] = "SETTLING"
-    symbols[3]["marginAsset"], symbols[4]["contractType"] = "USDC", "CURRENT_QUARTER"
-    monkeypatch.setattr(client, "symbols", lambda **kwargs: symbols)
-    assert list(scanner.candidates(client)[0]) == ["BTCUSDT"]
+    symbols[1]["status"] = "SETTLING"
+    monkeypatch.setattr(client, "symbols", lambda: symbols)
+    selected, eligible = scanner.candidates(client)
+    assert list(selected) == eligible == client.requested == ["BTCUSDT"]
 
 
 @pytest.mark.parametrize("bad_close", [1079 / 25, "1133", None, RuntimeError("Yahoo unavailable")])
-def test_scanner_yahoo_identity_rejects_and_backfills(monkeypatch, yahoo, bad_close, caplog):
+def test_scanner_yahoo_identity_failure_drops_selection_only(monkeypatch, yahoo, bad_close, caplog):
     monkeypatch.setattr(time, "time", lambda: NOW)
-    monkeypatch.setattr(scanner, "CANDIDATE_LIMIT", 2)
-    client = ScanClient([(base, 100, 1, 100) for base in ("AIN", "BTC", "ETH", "SOL")])
+    client = ScanClient([(base, 100, 1, 100) for base in ("BTC", "ETH", "SOL")])
     calls = []
 
     def history(ticker, **kwargs):
         calls.append(ticker.ticker)
-        if ticker.ticker == "AIN-USD":
+        if ticker.ticker == "BTC-USD":
             if isinstance(bad_close, Exception):
                 raise bad_close
             return yahoo.iloc[:0] if bad_close is None else yahoo.assign(Close=bad_close)
         return yahoo.assign(Close="1132.95")  # Exactly 5% above the completed Binance close.
 
     monkeypatch.setattr(scanner.yf.Ticker, "history", history)
-    assert list(scanner.candidates(client)[0]) == ["BTCUSDT", "ETHUSDT"]
-    assert calls == ["AIN-USD", "BTC-USD", "ETH-USD"]
-    assert client.requested == ["AINUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT"]
-    assert "AINUSDT: Yahoo identity unavailable" in caplog.text
+    selected, eligible = scanner.candidates(client)
+    assert list(selected) == ["ETHUSDT", "SOLUSDT"]
+    assert calls == ["BTC-USD", "ETH-USD", "SOL-USD"]
+    assert eligible == client.requested == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    assert "BTCUSDT: Yahoo identity unavailable" in caplog.text
 
 
 def test_symbols_uses_the_exchange_cache(monkeypatch):
@@ -293,45 +286,13 @@ def test_scan_retry_does_not_requeue_finished_holdings_and_closes_ignore_stale_g
 
 def test_scanner_symbol_failures_log_normally_with_one_scan_event(env, monkeypatch, caplog):
     conn, client, clock = env
-    scan = ScanClient([("BAD", 20, None, 100), ("BTC", 10, 1, 100), ("BADVOL", "NaN", 1, 100),
-                       ("BROKEN", 30, 1, 100)])
-    symbols = scan.symbols()
-    symbols[-1]["onboardDate"] = None
-    monkeypatch.setattr(scan, "symbols", lambda **kwargs: symbols)
+    scan = ScanClient([("ETH", 20, None, 100), ("BTC", 10, 1, 100), ("XRP", 30, None, 100)])
     monkeypatch.setattr(scanner, "candidates", scan_candidates)
     engine.step(conn, scan, clock[0])
     assert conn.execute("SELECT ticker FROM jobs").fetchone()[0] == "BTC-USD"
-    assert len(caplog.records) == 3
+    assert len(caplog.records) == 2
+    assert trading._get(conn, "engine_universe") == '["BTCUSDT"]'
     assert [r[0] for r in conn.execute("SELECT message FROM events WHERE source = 'engine'")] == ["Daily scan: BTCUSDT"]
-
-
-def test_scanner_uses_classification_not_asset_names(monkeypatch):
-    monkeypatch.setattr(time, "time", lambda: NOW)
-    client = ScanClient([(base, 100, 1, 100) for base in ("DOGE", "NEW_MEME", "STOCK", "GOLD")])
-    symbols = client.symbols()
-    symbols[1]["underlyingSubType"] = ["Crypto", "Meme"]
-    for symbol, kind in zip(symbols[2:], ("EQUITY", "COMMODITY"), strict=True):
-        symbol["underlyingType"] = kind
-        symbol["contractType"] = "TRADIFI_PERPETUAL"
-    monkeypatch.setattr(client, "symbols", lambda **kwargs: symbols)
-    assert list(scanner.candidates(client)[0]) == ["DOGEUSDT"]
-
-
-def test_scanner_uses_live_metadata_but_venue_tradability(monkeypatch):
-    monkeypatch.setattr(time, "time", lambda: NOW)
-    assets = [(base, 100, 1, 100) for base in ("BTC", "DOGE", "1000PEPE", "NEW", "LIVEONLY", "HALTED")]
-    client = ScanClient(assets)
-    metadata = client.symbols()
-    venue = [dict(s, underlyingType="EQUITY", underlyingSubType=["HOT"], onboardDate=0)
-             for s in metadata if s["symbol"] != "LIVEONLYUSDT"]
-    venue[-1]["status"] = "SETTLING"
-    metadata[0]["status"] = "SETTLING"
-    for item in metadata[1:3]:
-        item["underlyingSubType"] = ["Meme", "Crypto"]
-    metadata[3]["onboardDate"] = (NOW - 86400) * 1000
-    monkeypatch.setattr(client, "symbols", lambda *, live=False: metadata if live else venue)
-    assert list(scanner.candidates(client)[0]) == ["BTCUSDT"]
-    assert client.requested == ["BTCUSDT"]
 
 
 def test_execution_failure_is_bounded_and_does_not_block_later_decisions(env, monkeypatch):

@@ -1,4 +1,4 @@
-"""Daily liquid-contract selection, without scheduling or database state."""
+"""Daily fixed-universe selection, without scheduling or database state."""
 
 import logging
 import time
@@ -8,7 +8,8 @@ from decimal import Decimal as D
 import yfinance as yf
 
 log = logging.getLogger(__name__)
-MIN_AGE, VOLUME_LIMIT, CANDIDATE_LIMIT = 90 * 86400, 20, 5
+UNIVERSE = ("BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "LINKUSDT")
+CANDIDATE_LIMIT = 5
 FAST_EMA, SLOW_EMA, ATR_PERIOD = 20, 50, 14
 
 
@@ -57,26 +58,12 @@ def _yahoo_matches(symbol, close, closed_ms):
 def candidates(client):
     """Return top picks with frozen daily inputs and the full eligible shock universe."""
     now = time.time()
-    volumes = {}
-    for ticker in client.tickers():
-        try:
-            volume = D(ticker["quoteVolume"])
-            if not volume.is_finite() or volume < 0:
-                raise ValueError("Invalid volume")
-            volumes[ticker["symbol"]] = volume
-        except Exception as exc:
-            log.warning("%s: volume unavailable (%s)", ticker.get("symbol", "unknown"), type(exc).__name__)
     tradable = {s["symbol"] for s in client.symbols() if s.get("status") == "TRADING"}
-    universe = [s for s in client.symbols(live=True) if s.get("marginAsset") == "USDT"
-                and s.get("contractType") == "PERPETUAL" and s.get("symbol") in tradable
-                and s.get("underlyingType") == "COIN" and s.get("symbol") in volumes]
-    liquid = sorted(universe, key=lambda s: (-volumes.get(s["symbol"], D(0)), s["symbol"]))[:VOLUME_LIMIT]
     ranked = []
-    for item in liquid:
-        symbol = item["symbol"]
+    for symbol in UNIVERSE:
+        if symbol not in tradable:
+            continue
         try:
-            if "Meme" in item.get("underlyingSubType", []) or now * 1000 - item["onboardDate"] < MIN_AGE * 1000:
-                continue
             ranked.append((*_score(client, symbol, now), symbol))
         except Exception as exc:
             log.warning("%s: trend unavailable (%s)", symbol, type(exc).__name__)
