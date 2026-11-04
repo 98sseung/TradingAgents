@@ -8,7 +8,10 @@ import sqlite3
 import time
 from pathlib import Path
 
+from tradingagents.dataflows.symbols import normalize_symbol
+
 DB_PATH = Path(os.environ.get("TRADING_BOT_DB") or Path.home() / ".trading-bot" / "bot.db")
+WORKER_TIMEOUT = 60
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -56,6 +59,7 @@ ADDED_COLUMNS = {
         "stop_loss": "REAL",     # the Trader's stop, when it gave one
         "price_target": "REAL",  # the Portfolio Manager's target, when it gave one
         "source": "TEXT NOT NULL DEFAULT 'manual'",  # 'engine' jobs may trade; 'manual' ones never do
+        "worker": "TEXT",
     },
     "decisions": {"executed_at": "REAL", "attempts": "INTEGER NOT NULL DEFAULT 0"},
 }
@@ -67,11 +71,13 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")  # the GUI reads while the worker writes
     conn.executescript(SCHEMA)
-    for table, columns in ADDED_COLUMNS.items():
-        have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-        for column, decl in columns.items():  # a db made by an earlier version gains them in place
-            if column not in have:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")  # workers may start against the same older database
+        for table, columns in ADDED_COLUMNS.items():
+            have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for column, decl in columns.items():  # a db made by an earlier version gains them in place
+                if column not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
     return conn
 
 
@@ -84,28 +90,66 @@ def enqueue(conn, ticker: str, trade_date: str, analysts: list[str], source: str
     return cur.lastrowid
 
 
-def claim_next(conn) -> sqlite3.Row | None:
-    """Mark the oldest queued job running and return it, in one statement so two workers never share one."""
-    return conn.execute(
-        "UPDATE jobs SET status = 'running', started_at = ?, attempts = attempts + 1 "
-        "WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1) RETURNING *",
-        (time.time(),),
-    ).fetchone()
+def worker_names(environ=None) -> list[str]:
+    environ = os.environ if environ is None else environ
+    try:
+        count = int(environ.get("TRADING_BOT_WORKERS", "1"))
+        if count < 1:
+            raise ValueError
+    except ValueError:
+        raise ValueError("TRADING_BOT_WORKERS must be an integer >= 1") from None
+    return [f"worker-{n}" for n in range(1, count + 1)]
 
 
-def update(conn, job_id: int, **fields) -> None:
+def instrument(ticker: str) -> str:
+    ticker = normalize_symbol(ticker)
+    for suffix in ("-USDT", "USDT", "-USDC", "USDC"):
+        if ticker.endswith(suffix):
+            return ticker[:-len(suffix)] + "-USD"
+    return ticker
+
+
+def claim_next(conn, worker: str) -> sqlite3.Row | None:
+    """Claim the oldest eligible job, excluding aliases of any running ticker."""
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        running = {instrument(row["ticker"]) for row in conn.execute(
+            "SELECT ticker FROM jobs WHERE status = 'running'")}
+        job = next((row for row in conn.execute(
+            "SELECT id, ticker FROM jobs WHERE status = 'queued' ORDER BY created_at, id")
+            if instrument(row["ticker"]) not in running), None)
+        if job is None:
+            return None
+        return conn.execute(
+            "UPDATE jobs SET status = 'running', started_at = ?, attempts = attempts + 1, worker = ? "
+            "WHERE id = ? RETURNING *",
+            (time.time(), worker, job["id"]),
+        ).fetchone()
+
+
+def update(conn, job_id: int, *, owner: str | None = None, **fields) -> int:
     columns = ", ".join(f"{name} = ?" for name in fields)
-    conn.execute(f"UPDATE jobs SET {columns} WHERE id = ?", (*fields.values(), job_id))
+    where = "id = ?" + (" AND worker = ? AND status = 'running'" if owner else "")
+    params = (*fields.values(), job_id, owner) if owner else (*fields.values(), job_id)
+    return conn.execute(f"UPDATE jobs SET {columns} WHERE {where}", params).rowcount
 
 
-def requeue_orphans(conn) -> int:
-    """Jobs a dead worker left 'running': queue them again to resume, or fail them after MAX_ATTEMPTS."""
-    conn.execute(
-        "UPDATE jobs SET status = 'failed', error = 'worker stopped mid-run twice', finished_at = ? "
-        "WHERE status = 'running' AND attempts >= ?",
-        (time.time(), MAX_ATTEMPTS),
-    )
-    return conn.execute("UPDATE jobs SET status = 'queued' WHERE status = 'running'").rowcount
+def requeue_orphans(conn, worker: str) -> int:
+    """Recover this worker's old jobs and jobs without a live owner."""
+    now = time.time()
+    eligible = ("status = 'running' AND (worker = ? OR NOT EXISTS "
+                "(SELECT 1 FROM heartbeat h WHERE h.name = COALESCE(jobs.worker, 'worker') AND h.at >= ?))")
+    params = (worker, now - WORKER_TIMEOUT)
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', error = 'worker stopped mid-run twice', finished_at = ? "
+            f"WHERE attempts >= ? AND {eligible}",
+            (now, MAX_ATTEMPTS, *params),
+        )
+        return conn.execute(
+            f"UPDATE jobs SET status = 'queued', worker = NULL, started_at = NULL WHERE {eligible}", params,
+        ).rowcount
 
 
 def beat(conn, name: str, note: str = "") -> None:

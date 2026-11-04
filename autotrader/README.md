@@ -8,7 +8,7 @@
 | 모듈 | 실행 | 하는 일 |
 | --- | --- | --- |
 | `guard.py` | `python -m autotrader.guard` | Risk Guard. 5초마다 한도·KILL, 30초마다 원장 대사, 5분마다 보유기간 초과 청산 |
-| `worker.py` | `python -m autotrader.worker` | 대기열 분석 실행(TradingAgents), 체크포인트로 크래시 후 이어서 실행 |
+| `worker.py` | `python -m autotrader.worker` | 대기열 분석 실행(TradingAgents). `TRADING_BOT_WORKERS`개가 동시에 돌며 같은 종목은 겹치지 않음. 체크포인트로 크래시 후 이어서 실행, 죽은 워커의 작업만 회수 |
 | `engine.py` | `python -m autotrader.engine` | Master. 매일 00:05 UTC 종목 선정·분석 등록, 이벤트 재분석, 판정·주문 실행 |
 | `gui.py` | `python -m autotrader.gui` | 관리 화면(로그인 필요). 명령은 `control` 테이블에 쓰기만 함 |
 

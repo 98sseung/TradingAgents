@@ -55,6 +55,7 @@ TRADING_BOT_GUI_PASSWORD=8자이상비밀번호   # GUI 로그인 (없으면 GUI
 #TRADING_BOT_HOST=127.0.0.1   # 이 PC에서만 GUI를 열 때
 #TRADING_BOT_MODE=demo        # demo(기본) | live (실전, 2단계 전까지 쓰지 말 것)
 #TRADING_BOT_DAILY_BUDGET=12  # 엔진이 하루에 넣는 자동 분석 최대 개수
+TRADING_BOT_WORKERS=5         # 동시에 분석할 개수 (1이면 하나씩). 5개로 10종목 약 5.4분
 ```
 
 Binance 키는 `.env`가 아니라 별도 파일에 둡니다(권한 600).
@@ -93,7 +94,7 @@ python -m autotrader
 | 프로세스 | 역할 | 로그 |
 | --- | --- | --- |
 | guard | **Risk Guard**: 한도·KILL·손절 확인·원장 대사 | `~/.trading-bot/logs/guard.log` |
-| worker | **Worker**: 대기열의 분석을 하나씩 실행 | `~/.trading-bot/logs/worker.log` |
+| worker-1 … worker-N | **Worker**: 대기열의 분석을 동시에 N개 실행 (`TRADING_BOT_WORKERS`). 같은 종목은 동시에 돌지 않음 | `~/.trading-bot/logs/worker-<n>.log` |
 | engine | **Master**: 매일 09:05(KST) 종목 선정·분석 등록, 분석 결과로 판정·주문 | `~/.trading-bot/logs/engine.log` |
 | gui | **GUI**: 관리 화면 | `~/.trading-bot/logs/gui.log` |
 

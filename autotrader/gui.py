@@ -95,6 +95,18 @@ def _dot(kind: str) -> None:
     ui.element("span").classes(f"dot {kind}")
 
 
+def _worker_status(conn, now):
+    beats = {row["name"]: row for row in conn.execute("SELECT * FROM heartbeat WHERE name GLOB 'worker-[0-9]*'")
+             if row["name"][7:].isdigit() and int(row["name"][7:]) >= 1}
+    names = set(db.worker_names()) | {name for name, beat in beats.items() if 0 <= now - beat["at"] < ALIVE_SECONDS}
+    workers = []
+    for name in sorted(names, key=lambda name: int(name[7:])):
+        beat = beats.get(name)
+        alive = beat is not None and 0 <= now - beat["at"] < ALIVE_SECONDS
+        workers.append((name, alive, (beat["note"] or "idle") if alive else "offline"))
+    return tuple(workers)
+
+
 def _rating(rating: str | None) -> None:
     if rating:
         ui.label(rating).classes(f"rating r-{rating.lower() if rating in RATINGS else 'review'}")
@@ -223,6 +235,15 @@ def index() -> None:
             @ui.refreshable
             def master_chip() -> None:
                 for name, label in PROCESSES:
+                    if name == "worker":
+                        workers = _worker_status(conn, time.time())
+                        alive = sum(running for _, running, _ in workers)
+                        with ui.element("div").classes("chip"):
+                            _dot("ok" if alive else "bad")
+                            ui.label(f"{label} {alive}/{len(workers)}")
+                            ui.tooltip("\n".join(f"{name}: {note or 'idle'}" for name, _, note in workers)
+                                       or "python -m autotrader.worker").classes("whitespace-pre-line")
+                        continue
                     beat = db.heartbeat(conn, name)
                     alive = beat is not None and time.time() - beat["at"] < ALIVE_SECONDS
                     with ui.element("div").classes("chip"):
@@ -300,6 +321,8 @@ def index() -> None:
                                 _rating(job["rating"])
                             ui.label(f"#{job['id']} · {job['trade_date']} · {_duration(job)} · LLM {job['llm_calls'] or 0}"
                                      ).classes("text-xs text-slate-500 mono")
+                            if job["status"] == "running" and job["worker"]:
+                                ui.label(job["worker"]).classes("text-xs text-slate-500 mono")
 
                 with ui.element("div").classes("max-h-[52vh] overflow-y-auto flex flex-col gap-1"):
                     job_list()
@@ -351,6 +374,8 @@ def index() -> None:
                             _dot(JOB_LOOK.get(job["status"], ("", ""))[1])
                             ui.label(JOB_LOOK.get(job["status"], (job["status"],))[0])
                         ui.label(f"{job['trade_date']} · #{job['id']} · {_duration(job)}").classes("text-sm text-slate-400 mono")
+                        if job["status"] == "running" and job["worker"]:
+                            ui.label(job["worker"]).classes("text-xs text-slate-500 mono")
                         ui.space()
                         _rating(job["rating"])
                         if job["report_dir"] and (Path(job["report_dir"]) / "complete_report.html").exists():
@@ -466,9 +491,10 @@ def index() -> None:
         refresh()
 
     def refresh() -> None:
-        beats = [db.heartbeat(conn, name) for name, _ in PROCESSES]
-        if changed("master", tuple((b is not None and time.time() - b["at"] < ALIVE_SECONDS, b and b["note"])
-                                   for b in beats)):
+        beats = [db.heartbeat(conn, name) for name, _ in PROCESSES if name != "worker"]
+        process_state = tuple((b is not None and time.time() - b["at"] < ALIVE_SECONDS, b and b["note"])
+                              for b in beats)
+        if changed("master", (process_state, _worker_status(conn, time.time()))):
             master_chip.refresh()
         if changed("kpis", (tuple(db.usage_since(conn, _today())), _control("equity"))):
             kpis.refresh()
