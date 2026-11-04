@@ -151,6 +151,12 @@ def _side(side: str) -> None:
     ui.label(side).classes("rating whitespace-nowrap " + ("r-buy" if side == "LONG" else "r-sell"))
 
 
+def _price(value) -> str:
+    """Binance price string without trailing zeros ("0.00047550" -> "0.0004755")."""
+    text = str(value or "")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 def _age(since: float) -> str:
     hours = (time.time() - since) / 3600
     return f"{hours:.0f}시간" if hours < 48 else f"{hours / 24:.1f}일"
@@ -447,20 +453,24 @@ def index() -> None:
                                     ui.label(trade["symbol"]).classes("font-semibold mono")
                                     ui.space()
                                     ui.label(f"보유 {_age(trade['opened_at'])}").classes("text-xs text-slate-400")
-                                ui.label(f"수량 {trade['qty']} · 진입 {trade['entry_price']} · 손절 {trade['stop']}"
+                                ui.label(f"수량 {trade['qty']} · 손절 {trade['stop']}"
                                          f" · 목표 {trade['target']}").classes("text-xs text-slate-400 mono")
                                 position = live.get(trade["symbol"])
-                                if position:
+                                mark = _price(position.get("markPrice")) if position else ""
+                                if mark:
+                                    move = (float(mark) / float(trade["entry_price"]) - 1) * 100
+                                    ui.label(f"진입 {_price(trade['entry_price'])} → 현재 {mark} ({move:+.2f}%)").classes(
+                                        "text-sm mono text-slate-200")
                                     pnl = float(position.get("unRealizedProfit") or 0)
                                     margin = float(position.get("initialMargin") or 0)
                                     roe = pnl / margin * 100 if margin else 0
                                     lev = abs(float(position.get("notional") or 0)) / margin if margin else 0
-                                    ui.label(f"현재 {position.get('markPrice') or '—'} · 미실현 {pnl:+.2f} USDT"
-                                             f" ({roe:+.2f}%) · {lev:.0f}배").classes(
-                                        "text-xs mono " + ("text-emerald-400" if pnl >= 0 else "text-rose-400")
-                                    ).tooltip("수수료·펀딩 제외")
+                                    ui.label(f"미실현 {pnl:+.2f} USDT · 수익률 {roe:+.2f}% · {lev:.0f}배").classes(
+                                        "text-sm mono " + ("text-emerald-400" if pnl >= 0 else "text-rose-400")
+                                    ).tooltip("수수료·펀딩 제외, 수익률은 증거금 대비")
                                 else:
-                                    ui.label("시세 대기 중").classes("text-xs text-slate-500")
+                                    ui.label(f"진입 {_price(trade['entry_price'])} → 현재 시세 대기 중").classes(
+                                        "text-sm mono text-slate-500")
                         if closed:
                             ui.label("최근 청산").classes("text-xs text-slate-500 mt-2")
                         for trade in closed:
