@@ -1,5 +1,6 @@
 """Master scheduler. Run beside the analysis worker and the independent Risk Guard."""
 
+import json
 import os
 import time
 from datetime import UTC, datetime
@@ -12,11 +13,17 @@ INTERVAL, EVENT_INTERVAL, REANALYSIS_AGE, GUARD_AGE = 30, 300, 6 * 3600, 30
 DAILY_BUDGET = int(os.environ.get("TRADING_BOT_DAILY_BUDGET", "12"))
 MAX_ATTEMPTS = 3
 ANALYSTS = ["market", "social", "news"]
+_shock_ratios = {}
 
 
 def _event(conn, level, message):
     conn.execute("INSERT INTO events (at, level, source, message) VALUES (?, ?, 'engine', ?)",
                  (time.time(), level, message))
+
+
+def _budget_count(conn, midnight):
+    return conn.execute("SELECT COUNT(*) FROM jobs WHERE source IN ('engine', 'shock') AND created_at >= ? "
+                        "AND created_at < ?", (midnight, midnight + 86400)).fetchone()[0]
 
 
 def _enqueue(conn, symbol, today, midnight, *, daily=False):
@@ -27,8 +34,7 @@ def _enqueue(conn, symbol, today, midnight, *, daily=False):
         return
     queued = conn.execute("SELECT 1 FROM jobs WHERE source = 'engine' AND ticker = ? "
                           "AND status IN ('queued', 'running')", (ticker,)).fetchone()
-    count = conn.execute("SELECT COUNT(*) FROM jobs WHERE source = 'engine' AND created_at >= ? "
-                         "AND created_at < ?", (midnight, midnight + 86400)).fetchone()[0]
+    count = _budget_count(conn, midnight)
     if not queued and count >= DAILY_BUDGET:
         if trading._get(conn, "engine_budget_date") != today:
             _event(conn, "warn", "Daily analysis budget exhausted")
@@ -37,8 +43,65 @@ def _enqueue(conn, symbol, today, midnight, *, daily=False):
         db.enqueue(conn, ticker, today, ANALYSTS, source="engine")
 
 
+def _four_hour(client, symbol, now):
+    bars = [b for b in client.klines(symbol, "5m", 60) if b[6] < now * 1000]
+    latest = bars[-1]
+    previous = next(b for b in bars if b[0] == latest[0] - 48 * 300_000)
+    return D(latest[4]), D(previous[4])
+
+
+def _shocks(conn, client, now, today, midnight):
+    crossings = []
+    for symbol in json.loads(trading._get(conn, "engine_universe", "[]")):
+        try:
+            price, previous = _four_hour(client, symbol, now)
+            atr = trading._indicators(client, symbol)[1]
+            ratio = (price - previous) / atr
+            last = _shock_ratios.get(symbol)
+            _shock_ratios[symbol] = ratio
+            if last is not None and abs(last) < D("1.5") <= abs(ratio):
+                crossings.append((abs(ratio), symbol, ratio, atr, price))
+        except (IndexError, StopIteration):
+            continue  # No completed pair exactly four hours apart yet.
+        except Exception as exc:
+            _event(conn, "error", f"{symbol}: shock check failed ({type(exc).__name__})")
+    if not crossings:
+        return
+    _, symbol, ratio, atr, price = max(crossings)
+    ticker = symbol.removesuffix("USDT") + "-USD"
+    try:
+        positions = {p["symbol"] for p in client.positions()}
+        positions.update(t["symbol"] for t in conn.execute("SELECT symbol FROM trades WHERE status = 'open'"))
+        gates = [
+            (conn.execute("SELECT 1 FROM jobs WHERE source = 'shock' AND created_at >= ? AND created_at < ?",
+                          (midnight, midnight + 86400)).fetchone(), "Shock job already created this UTC day"),
+            (conn.execute("SELECT 1 FROM jobs WHERE source = 'shock' AND ticker = ? AND created_at >= ?",
+                          (ticker, now - 86400)).fetchone(), "Symbol had a shock job in the last 24h"),
+            (symbol in positions, "Symbol is held"),
+            (now < float(trading._get(conn, "cooldown:" + symbol, 0)), "Stop cooldown"),
+            (trading._shock_open(conn), "Shock-origin position open"),
+            (len(positions) >= trading.MAX_POSITIONS, "Maximum open positions"),
+            (_budget_count(conn, midnight) >= DAILY_BUDGET, "Daily analysis budget exhausted"),
+        ]
+        for blocked, reason in gates:
+            if blocked:
+                _event(conn, "info", f"{symbol}: shock skipped: {reason}")
+                return
+        daily = [b for b in client.klines(symbol, "1d", 100) if b[6] < now * 1000][-1]
+        if not scanner._yahoo_matches(symbol, D(daily[4]), daily[6]):
+            _event(conn, "info", f"{symbol}: shock skipped: Yahoo identity mismatch")
+            return
+        btc_price, btc_previous = _four_hour(client, "BTCUSDT", now)
+        facts = {"direction": 1 if ratio > 0 else -1, "atr": float(atr), "ratio": float(ratio),
+                 "detected_at": now, "price": float(price),
+                 "btc_move_pct": float((btc_price / btc_previous - 1) * 100)}
+        db.enqueue(conn, ticker, today, ANALYSTS, source="shock", shock=json.dumps(facts))
+    except Exception as exc:
+        _event(conn, "error", f"{symbol}: shock enqueue failed ({type(exc).__name__})")
+
+
 def _jobs(conn, client, now):
-    for job in conn.execute("SELECT * FROM jobs j WHERE source = 'engine' AND status = 'done' "
+    for job in conn.execute("SELECT * FROM jobs j WHERE source IN ('engine', 'shock') AND status = 'done' "
                             "AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.job_id = j.id) ORDER BY id").fetchall():
         try:
             db.beat(conn, "engine", f"deciding job {job['id']}")
@@ -46,7 +109,7 @@ def _jobs(conn, client, now):
         except Exception as exc:
             _event(conn, "error", f"Job {job['id']}: decision failed ({type(exc).__name__})")
     rows = conn.execute("SELECT d.* FROM decisions d JOIN jobs j ON j.id = d.job_id "
-                        "WHERE j.source = 'engine' AND j.status = 'done' AND d.executed_at IS NULL "
+                        "WHERE j.source IN ('engine', 'shock') AND j.status = 'done' AND d.executed_at IS NULL "
                         "ORDER BY d.id").fetchall()
     for decision in rows:
         key, action = decision["id"], decision["action"]
@@ -83,7 +146,8 @@ def step(conn, client, now):
     if now >= midnight + 300 and trading._get(conn, "engine_scan_date") != today:
         scanned = True
         try:
-            selected = scanner.candidates(client)
+            selected, eligible = scanner.candidates(client)
+            trading._set(conn, "engine_universe", json.dumps(eligible))
             _event(conn, "info", "Daily scan: " + (", ".join(selected) or "none"))
         except Exception as exc:
             selected, scanned = [], False
@@ -98,6 +162,7 @@ def step(conn, client, now):
             trading._set(conn, "engine_scan_date", today)
     if now - float(trading._get(conn, "engine_event_at", "-inf")) >= EVENT_INTERVAL:
         trading._set(conn, "engine_event_at", now)
+        _shocks(conn, client, now, today, midnight)
         for symbol in symbols:
             try:
                 last = conn.execute("SELECT MAX(created_at) FROM jobs WHERE source = 'engine' AND ticker = ?",

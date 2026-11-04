@@ -1,5 +1,6 @@
 """Score finished analyses once against subsequent live hourly candles."""
 
+import json
 import logging
 from decimal import Decimal as D
 
@@ -17,6 +18,20 @@ def verdict(rating, ret_pct):
     if abs(ret_pct) < 1:
         return "inconclusive"
     return "correct" if expect * ret_pct > 0 else "wrong"
+
+
+def _mechanical(facts, bars, entry, exit_price):
+    direction, atr = D(facts["direction"]), D(str(facts["atr"]))
+    stop, target = entry - direction * D("1.5") * atr, entry + direction * 3 * atr
+    for bar in bars:
+        high, low = D(bar[2]), D(bar[3])
+        if (low <= stop if direction > 0 else high >= stop):
+            exit_price = stop
+            break
+        if (high >= target if direction > 0 else low <= target):
+            exit_price = target
+            break
+    return float((direction * (exit_price - entry) - entry * D("0.001")) / atr)
 
 
 def score(conn, client, now) -> int:
@@ -43,11 +58,13 @@ def score(conn, client, now) -> int:
                 if not entry.is_finite() or entry <= 0 or not exit_price.is_finite() or exit_price <= 0:
                     raise ValueError("Invalid candle price")
                 ret = (exit_price / entry - 1) * 100
+                mech = (_mechanical(json.loads(job["shock"]), bars, entry, exit_price)
+                        if job["source"] == "shock" and job["shock"] and horizon == 120 else None)
                 written += conn.execute(
-                    "INSERT INTO outcomes (job_id, horizon_h, symbol, rating, entry, exit, ret_pct, verdict, scored_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id, horizon_h) DO NOTHING",
+                    "INSERT INTO outcomes (job_id, horizon_h, symbol, rating, entry, exit, ret_pct, verdict, scored_at, "
+                    "mech_atr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id, horizon_h) DO NOTHING",
                     (job["id"], horizon, symbol, job["rating"], str(entry), str(exit_price),
-                     float(ret), verdict(job["rating"], ret), now),
+                     float(ret), verdict(job["rating"], ret), now, mech),
                 ).rowcount
         except Exception as exc:
             log.warning("Job %s: scoring failed (%s)", job["id"], type(exc).__name__)

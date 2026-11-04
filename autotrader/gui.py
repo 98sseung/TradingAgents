@@ -318,6 +318,8 @@ def index() -> None:
                                     ui.label(job["ticker"]).classes("font-semibold mono")
                                     if job["source"] == "engine":
                                         ui.label("자동").classes("chip text-sky-400").tooltip("엔진이 넣은 분석 · 매매로 이어질 수 있음")
+                                    elif job["source"] == "shock":
+                                        ui.label("급변").classes("chip text-sky-400").tooltip("급변 감지 분석 · 매매로 이어질 수 있음")
                                 _rating(job["rating"])
                             ui.label(f"#{job['id']} · {job['trade_date']} · {_duration(job)} · LLM {job['llm_calls'] or 0}"
                                      ).classes("text-xs text-slate-500 mono")

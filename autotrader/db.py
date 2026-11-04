@@ -62,10 +62,12 @@ ADDED_COLUMNS = {
         "attempts": "INTEGER NOT NULL DEFAULT 0",
         "stop_loss": "REAL",     # the Trader's stop, when it gave one
         "price_target": "REAL",  # the Portfolio Manager's target, when it gave one
-        "source": "TEXT NOT NULL DEFAULT 'manual'",  # 'engine' jobs may trade; 'manual' ones never do
+        "source": "TEXT NOT NULL DEFAULT 'manual'",  # engine/shock jobs may trade; manual ones never do
+        "shock": "TEXT",         # frozen detection facts, JSON
         "worker": "TEXT",
     },
     "decisions": {"executed_at": "REAL", "attempts": "INTEGER NOT NULL DEFAULT 0"},
+    "outcomes": {"mech_atr": "REAL"},
 }
 
 
@@ -85,11 +87,11 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-def enqueue(conn, ticker: str, trade_date: str, analysts: list[str], source: str = "manual") -> int:
-    """Queue an analysis. Only ``source='engine'`` jobs can lead to trades; GUI ones are for reading."""
+def enqueue(conn, ticker: str, trade_date: str, analysts: list[str], source: str = "manual", shock=None) -> int:
+    """Queue an analysis. Engine/shock jobs may trade; GUI ones are for reading."""
     cur = conn.execute(
-        "INSERT INTO jobs (ticker, trade_date, analysts, created_at, source) VALUES (?, ?, ?, ?, ?)",
-        (ticker, trade_date, ",".join(analysts), time.time(), source),
+        "INSERT INTO jobs (ticker, trade_date, analysts, created_at, source, shock) VALUES (?, ?, ?, ?, ?, ?)",
+        (ticker, trade_date, ",".join(analysts), time.time(), source, shock),
     )
     return cur.lastrowid
 

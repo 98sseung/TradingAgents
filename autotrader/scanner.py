@@ -55,6 +55,7 @@ def _yahoo_matches(symbol, close, closed_ms):
 
 
 def candidates(client):
+    """Return the Yahoo-checked top picks and the full eligible shock universe."""
     now = time.time()
     volumes = {}
     for ticker in client.tickers():
@@ -85,4 +86,4 @@ def candidates(client):
             selected.append(symbol)
             if len(selected) == CANDIDATE_LIMIT:
                 break
-    return selected
+    return selected, [row[3] for row in ranked]

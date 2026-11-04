@@ -72,6 +72,12 @@ def _trade(conn, symbol):
     return conn.execute("SELECT * FROM trades WHERE symbol = ? AND status = 'open'", (symbol,)).fetchone()
 
 
+def _shock_open(conn, symbol=None):
+    return conn.execute("SELECT 1 FROM trades t JOIN decisions d ON d.id = t.decision_id "
+                        "JOIN jobs j ON j.id = d.job_id WHERE t.status = 'open' AND j.source = 'shock' "
+                        "AND t.symbol = COALESCE(?, t.symbol)", (symbol,)).fetchone()
+
+
 def _indicators(client, symbol):
     bars = [b for b in client.klines(symbol, "1d", 100) if b[6] < time.time() * 1000]
     if len(bars) < PERIOD + 1:
@@ -103,15 +109,22 @@ def _evaluate(conn, client, job):
     action, reason, symbol = "none", "Rating does not request entry", job["ticker"]
     try:
         symbol = symbol_for(symbol)
+        shock = json.loads(job["shock"]) if job.get("source") == "shock" else None
+        if shock and rating not in (("Buy", "Overweight") if shock["direction"] == 1 else ("Sell",)):
+            raise ValueError("LLM veto: rating disagrees with shock")
         position = _position(client, symbol)
         amount = D(position["positionAmt"]) if position else D(0)
         if amount:
+            # Shock trades keep the tested fixed exits (stop, target, 5-day expiry); a later rating must not close them.
+            fixed = _shock_open(conn, symbol)
             action = (
                 "close"
-                if (amount > 0 and rating in ("Underweight", "Sell") or amount < 0 and rating in ("Buy", "Overweight"))
+                if not fixed
+                and (amount > 0 and rating in ("Underweight", "Sell") or amount < 0 and rating in ("Buy", "Overweight"))
                 else "hold"
             )
-            reason, qty = "Rating requests exit" if action == "close" else "Rating keeps position", abs(amount)
+            reason, qty = ("Rating requests exit" if action == "close" else
+                           "Shock trade keeps its fixed exits" if fixed else "Rating keeps position"), abs(amount)
             mark = D(client.mark_price(symbol)["markPrice"])
         elif rating in ("Buy", "Overweight", "Sell"):
             mark = D(client.mark_price(symbol)["markPrice"])
@@ -135,6 +148,14 @@ def _evaluate(conn, client, job):
             for blocked, message in gates:
                 if blocked:
                     raise ValueError(message)
+            if shock:
+                if _shock_open(conn):
+                    raise ValueError("Shock-origin position open")
+                sides = {r["symbol"]: 1 if r["side"] == "LONG" else -1
+                         for r in conn.execute("SELECT symbol, side FROM trades WHERE status = 'open'")}
+                sides.update({p["symbol"]: 1 if D(p["positionAmt"]) > 0 else -1 for p in positions})
+                if sum(side == shock["direction"] for side in sides.values()) >= 2:
+                    raise ValueError("Two open positions share shock direction")
             rsi, atr = _indicators(client, symbol)
             direction = D(-1) if rating == "Sell" else D(1)
             if (direction > 0 and rsi > LONG_RSI) or (direction < 0 and rsi < SHORT_RSI):
@@ -144,13 +165,18 @@ def _evaluate(conn, client, job):
             if margin > D(balance["available"]):
                 raise ValueError("Insufficient available balance")
             qty = round_quantity(margin * LEVERAGE / mark, mark, filters)
-            stop = D(str(job.get("stop_loss") or 0))
-            if not stop.is_finite() or stop <= 0 or not MIN_ATR * atr <= direction * (mark - stop) <= MAX_ATR * atr:
+            stop = D(0) if shock else D(str(job.get("stop_loss") or 0))
+            if shock:
+                atr = D(str(shock["atr"]))
+                stop = mark - direction * D("1.5") * atr
+            elif not stop.is_finite() or stop <= 0 or not MIN_ATR * atr <= direction * (mark - stop) <= MAX_ATR * atr:
                 stop = mark - direction * STOP_ATR * atr
             stop = round_price(stop, filters["tick_size"])
             risk = direction * (mark - stop)
-            target = D(str(job.get("price_target") or 0))
-            if not target.is_finite() or target <= 0 or direction * (target - mark) <= risk:
+            target = D(0) if shock else D(str(job.get("price_target") or 0))
+            if shock:
+                target = mark + direction * 3 * atr
+            elif not target.is_finite() or target <= 0 or direction * (target - mark) <= risk:
                 target = mark + direction * TARGET_R * risk
             target = round_price(target, filters["tick_size"])
             if risk <= 0 or direction * (target - mark) <= risk:
@@ -231,10 +257,12 @@ def _protect(conn, client, trade):
     if risk <= 0:
         raise ValueError("Fill crossed the approved stop")
     proposed = conn.execute(
-        "SELECT j.price_target FROM jobs j JOIN decisions d ON d.job_id = j.id WHERE d.id = ?", (trade["decision_id"],)
+        "SELECT j.price_target, j.source FROM jobs j JOIN decisions d ON d.job_id = j.id WHERE d.id = ?",
+        (trade["decision_id"],)
     ).fetchone()
+    shock = proposed and proposed["source"] == "shock"
     proposed = D(str(proposed[0] or 0)) if proposed else D(0)
-    if not proposed.is_finite() or proposed <= 0 or direction * (proposed - entry) <= risk:
+    if not shock and (not proposed.is_finite() or proposed <= 0 or direction * (proposed - entry) <= risk):
         trade["target"] = str(
             round_price(entry + direction * TARGET_R * risk, client.filters(trade["symbol"])["tick_size"])
         )

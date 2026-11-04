@@ -11,8 +11,11 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from autotrader import db
+from autotrader import db, trading
+from autotrader.binance import BinanceClient
 from autotrader.board import board_texts
 from cli.models import AnalystType
 from cli.prompts import detect_asset_type, filter_analysts_for_asset_type
@@ -30,6 +33,8 @@ current = {"note": "idle"}  # what the heartbeat reports
 
 
 class TradingMandate(PortfolioContext):
+    mandate_text: str = ""
+
     def render(self, ticker: str) -> str:
         return (
             "Trading mandate (an automated execution layer acts on your rating):\n"
@@ -42,7 +47,31 @@ class TradingMandate(PortfolioContext):
             "Use Hold or Underweight only when you would not open a position either way.\n"
             "- Current holdings are not given here; the execution layer handles existing positions. "
             "Stop loss and target must be prices for this 5-day trade."
-        )
+        ) + self.mandate_text
+
+
+def _shock_text(job):
+    if not job["shock"]:
+        return ""
+    facts = json.loads(job["shock"])
+    kst = ZoneInfo("Asia/Seoul")
+    detected = datetime.fromtimestamp(facts["detected_at"], kst).strftime("%Y-%m-%d %H:%M KST")
+    move = (facts["price"] / (facts["price"] - facts["ratio"] * facts["atr"]) - 1) * 100
+    lines = [f"\n\nPrice shock detected at {detected}:",
+             f"- {job['ticker']} 4h move: {move:+.2f}% ({facts['ratio']:+.2f} daily ATRs, "
+             f"{'up/long' if facts['direction'] > 0 else 'down/short'}).",
+             f"- BTCUSDT 4h move: {facts['btc_move_pct']:+.2f}%.",
+             "- Last 6 completed 1h bars (KST hour, high, low, close):"]
+    client = BinanceClient()
+    try:
+        bars = [b for b in client.klines(trading.symbol_for(job["ticker"]), "1h", 7)
+                if b[6] < time.time() * 1000][-6:]
+    finally:
+        client._session.close()
+    for bar in bars:
+        hour = datetime.fromtimestamp(bar[0] / 1000, kst).strftime("%Y-%m-%d %H:00")
+        lines.append(f"  {hour}: high {bar[2]}, low {bar[3]}, close {bar[4]}")
+    return "\n".join(lines)
 
 
 def level(text: str, label: str) -> float | None:
@@ -84,7 +113,7 @@ def run_job(conn, job) -> None:
     # Checkpointed, so a job requeued after a worker crash resumes at its last finished agent instead of re-paying for it.
     graph = TradingAgentsGraph(analysts, config={**DEFAULT_CONFIG, "checkpoint_enabled": True}, callbacks=[stats])
     run = (ticker, job["trade_date"], asset_type.value)
-    portfolio = TradingMandate()
+    portfolio = TradingMandate(mandate_text=_shock_text(job))
     init_state = graph.create_run_state(*run, portfolio=portfolio)
     args = graph.propagator.get_graph_args(callbacks=[stats])
     args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = graph.begin_checkpoint(

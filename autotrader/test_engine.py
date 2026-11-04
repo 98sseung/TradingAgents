@@ -51,7 +51,7 @@ def env(tmp_path, monkeypatch):
     clock = [NOW]
     monkeypatch.setattr(time, "time", lambda: clock[0])
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(scanner, "candidates", lambda client: [])
+    monkeypatch.setattr(scanner, "candidates", lambda client: ([], []))
     return db.connect(tmp_path / "bot.db"), FakeClient(), clock
 
 
@@ -73,7 +73,9 @@ def test_scanner_age_memes_and_completed_trend_ranking(monkeypatch, yahoo):
     monkeypatch.setattr(client, "symbols", lambda **kwargs: symbols)
     monkeypatch.setattr(scanner.yf.Ticker, "history", lambda ticker, **kwargs:
                         yahoo.assign(Close=1000 + 79 * bases.index(ticker.ticker.removesuffix("-USD"))))
-    assert scanner.candidates(client) == [s + "USDT" for s in ("LINK", "ADA", "XRP", "ETH", "SOL")]
+    selected, eligible = scanner.candidates(client)
+    assert selected == [s + "USDT" for s in ("LINK", "ADA", "XRP", "ETH", "SOL")]
+    assert eligible == [base + "USDT" for base in bases]
     assert set(client.requested) == {base + "USDT" for base, volume, slope, age in client.assets[:7]}
 
 
@@ -81,13 +83,13 @@ def test_scanner_takes_top_volume_before_exclusions(monkeypatch, yahoo):
     monkeypatch.setattr(time, "time", lambda: NOW)
     yahoo["Close"] = 8900
     client = ScanClient([(f"NEW{i}", 1000 - i, 1, 1) for i in range(20)] + [("BTC", 1, 100, 100)])
-    assert scanner.candidates(client) == [] and client.requested == []
+    assert scanner.candidates(client)[0] == [] and client.requested == []
     symbols = client.symbols()
     for item in symbols[:3]:
         item["status"] = "SETTLING"
     symbols[3]["marginAsset"], symbols[4]["contractType"] = "USDC", "CURRENT_QUARTER"
     monkeypatch.setattr(client, "symbols", lambda **kwargs: symbols)
-    assert scanner.candidates(client) == ["BTCUSDT"]
+    assert scanner.candidates(client)[0] == ["BTCUSDT"]
 
 
 @pytest.mark.parametrize("bad_close", [1079 / 25, "1133", None, RuntimeError("Yahoo unavailable")])
@@ -106,7 +108,7 @@ def test_scanner_yahoo_identity_rejects_and_backfills(monkeypatch, yahoo, bad_cl
         return yahoo.assign(Close="1132.95")  # Exactly 5% above the completed Binance close.
 
     monkeypatch.setattr(scanner.yf.Ticker, "history", history)
-    assert scanner.candidates(client) == ["BTCUSDT", "ETHUSDT"]
+    assert scanner.candidates(client)[0] == ["BTCUSDT", "ETHUSDT"]
     assert calls == ["AIN-USD", "BTC-USD", "ETH-USD"]
     assert client.requested == ["AINUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT"]
     assert "AINUSDT: Yahoo identity unavailable" in caplog.text
@@ -132,7 +134,7 @@ def test_symbols_uses_the_exchange_cache(monkeypatch):
 def test_daily_scan_once_per_day_and_deduplicates(env, monkeypatch):
     conn, client, clock = env
     calls = []
-    monkeypatch.setattr(scanner, "candidates", lambda client: calls.append(clock[0]) or ["BTCUSDT"])
+    monkeypatch.setattr(scanner, "candidates", lambda client: calls.append(clock[0]) or (["BTCUSDT"], ["BTCUSDT"]))
     clock[0] = MIDNIGHT + 299
     engine.step(conn, client, clock[0])
     assert calls == []
@@ -152,7 +154,7 @@ def test_budget_counts_failed_engine_jobs_not_manual_and_warns_once(env, monkeyp
     db.update(conn, done(conn, "BAD-USD")["id"], status="failed")
     done(conn, source="manual")
     monkeypatch.setattr(engine, "DAILY_BUDGET", 2)
-    monkeypatch.setattr(scanner, "candidates", lambda client: ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+    monkeypatch.setattr(scanner, "candidates", lambda client: (["BTCUSDT", "ETHUSDT", "SOLUSDT"], []))
     engine.step(conn, client, clock[0])
     trading._set(conn, "engine_scan_date", "")
     engine.step(conn, client, clock[0])
@@ -305,7 +307,7 @@ def test_scanner_uses_classification_not_asset_names(monkeypatch):
         symbol["underlyingType"] = kind
         symbol["contractType"] = "TRADIFI_PERPETUAL"
     monkeypatch.setattr(client, "symbols", lambda **kwargs: symbols)
-    assert scanner.candidates(client) == ["DOGEUSDT"]
+    assert scanner.candidates(client)[0] == ["DOGEUSDT"]
 
 
 def test_scanner_uses_live_metadata_but_venue_tradability(monkeypatch):
@@ -321,7 +323,7 @@ def test_scanner_uses_live_metadata_but_venue_tradability(monkeypatch):
         item["underlyingSubType"] = ["Meme", "Crypto"]
     metadata[3]["onboardDate"] = (NOW - 86400) * 1000
     monkeypatch.setattr(client, "symbols", lambda *, live=False: metadata if live else venue)
-    assert scanner.candidates(client) == ["BTCUSDT"]
+    assert scanner.candidates(client)[0] == ["BTCUSDT"]
     assert client.requested == ["BTCUSDT"]
 
 

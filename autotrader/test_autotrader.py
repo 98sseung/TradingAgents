@@ -1,5 +1,6 @@
 """Run: python -m pytest autotrader -q"""
 
+import json
 import sqlite3
 from types import SimpleNamespace
 
@@ -156,10 +157,15 @@ def test_worker_name_heartbeat_and_periodic_orphan_sweep(tmp_path, monkeypatch, 
 
 
 @pytest.mark.parametrize("interrupted", [False, True])
-def test_checkpoint_identity_and_resume_are_preserved(tmp_path, monkeypatch, interrupted):
+@pytest.mark.parametrize("shock", [False, True])
+def test_checkpoint_identity_and_resume_are_preserved(tmp_path, monkeypatch, interrupted, shock):
     from autotrader import worker
     conn, calls, handlers = db.connect(tmp_path / "bot.db"), [], []
-    db.enqueue(conn, "BTC-USDT", "2026-11-03", ["market"])
+    facts = {"direction": -1, "atr": 4, "ratio": -2, "price": 100, "detected_at": 0, "btc_move_pct": 1.25}
+    db.enqueue(conn, "BTC-USDT", "2026-11-03", ["market"], shock=json.dumps(facts) if shock else None)
+    monkeypatch.setattr(worker, "BinanceClient", lambda: SimpleNamespace(
+        klines=lambda *args: [[0, "1", "110", "90", "100", 0, 1]] * 6 + [[0, 0, 0, 0, 0, 0, float("inf")]],
+        _session=SimpleNamespace(close=lambda: None)))
     job = db.claim_next(conn, "worker-1")
     def stream(state, **args):
         assert state is None and args["config"]["configurable"]["thread_id"] == "saved-thread"
@@ -194,6 +200,10 @@ def test_checkpoint_identity_and_resume_are_preserved(tmp_path, monkeypatch, int
                for name, args in calls if name != "end")
     mandate = portfolio.render("BTC-USDT")
     assert "opens a short" in mandate and "5 days" in mandate
+    assert portfolio.fingerprint() != worker.TradingMandate().fingerprint() if shock else not portfolio.mandate_text
+    if shock:
+        assert all(text in mandate for text in ("1970-01-01 09:00 KST", "-7.41%", "-2.00 daily ATRs", "down/short", "+1.25%"))
+        assert mandate.count("high 110, low 90, close 100") == 6
     assert any(name == "clear" for name, _ in calls) == (not interrupted)
     assert "saved report" in db.get_job(conn, job["id"])["board"]
     assert db.get_job(conn, job["id"])["llm_calls"] == (2 if interrupted else 1)
