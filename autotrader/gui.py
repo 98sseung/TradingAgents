@@ -436,6 +436,8 @@ def index() -> None:
                         open_trades = conn.execute("SELECT * FROM trades WHERE status = 'open' ORDER BY id DESC").fetchall()
                         closed = conn.execute(
                             "SELECT * FROM trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 5").fetchall()
+                        snapshot = json.loads(_control("positions") or "{}")
+                        live = snapshot.get("items", {}) if time.time() - snapshot.get("at", 0) <= 60 else {}
                         if not open_trades and not closed:
                             ui.label("아직 거래가 없습니다").classes("text-sm text-slate-500")
                         for trade in open_trades:
@@ -447,6 +449,18 @@ def index() -> None:
                                     ui.label(f"보유 {_age(trade['opened_at'])}").classes("text-xs text-slate-400")
                                 ui.label(f"수량 {trade['qty']} · 진입 {trade['entry_price']} · 손절 {trade['stop']}"
                                          f" · 목표 {trade['target']}").classes("text-xs text-slate-400 mono")
+                                position = live.get(trade["symbol"])
+                                if position:
+                                    pnl = float(position.get("unRealizedProfit") or 0)
+                                    margin = float(position.get("initialMargin") or 0)
+                                    roe = pnl / margin * 100 if margin else 0
+                                    lev = abs(float(position.get("notional") or 0)) / margin if margin else 0
+                                    ui.label(f"현재 {position.get('markPrice') or '—'} · 미실현 {pnl:+.2f} USDT"
+                                             f" ({roe:+.2f}%) · {lev:.0f}배").classes(
+                                        "text-xs mono " + ("text-emerald-400" if pnl >= 0 else "text-rose-400")
+                                    ).tooltip("수수료·펀딩 제외")
+                                else:
+                                    ui.label("시세 대기 중").classes("text-xs text-slate-500")
                         if closed:
                             ui.label("최근 청산").classes("text-xs text-slate-500 mt-2")
                         for trade in closed:
@@ -538,7 +552,10 @@ def index() -> None:
             board_view.refresh()
         if changed("control", tuple(tuple(r) for r in conn.execute("SELECT key, value FROM control"))):
             control_bar.refresh()
-        if changed("trades", tuple(tuple(r) for r in conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 20"))):
+        snapshot = _control("positions")
+        stale = time.time() - json.loads(snapshot or "{}").get("at", 0) > 60
+        if changed("trades", (tuple(tuple(r) for r in conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 20")),
+                              snapshot, stale)):
             positions.refresh()
         last_event = conn.execute("SELECT MAX(id) FROM events").fetchone()[0]
         if changed("activity", (last_decision, last_event)):

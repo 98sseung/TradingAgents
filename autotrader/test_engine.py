@@ -1,5 +1,6 @@
 """Offline scanner and process steps driven by an explicit clock."""
 
+import json
 import time
 from datetime import UTC, datetime
 from decimal import Decimal as D
@@ -229,6 +230,29 @@ def test_event_reanalysis_obeys_atr_age_cadence_and_engine_source(env):
     clock[0] += 1
     engine.step(conn, client, clock[0])
     assert conn.execute("SELECT COUNT(*) FROM jobs WHERE source = 'engine'").fetchone()[0] == 3
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_guard_equity_stores_position_snapshot_without_extra_requests(env, monkeypatch, empty):
+    conn, client, clock = env
+    items = {} if empty else {
+        "HOTUSDT": {"markPrice": "0.00210000", "unRealizedProfit": "1.23",
+                    "initialMargin": "10.00000000", "notional": "50.00000000"},
+        "BTCUSDT": {"markPrice": "100000.00000000", "unRealizedProfit": "-1.22",
+                    "initialMargin": "20.00000000", "notional": "-100.00000000"},
+    }
+    calls = []
+
+    def positions():
+        calls.append("positions")
+        return [{"symbol": symbol, "positionAmt": "1", **values} for symbol, values in items.items()]
+
+    monkeypatch.setattr(client, "positions", positions)
+    trading._set(conn, "positions", '{"at": 0, "items": {"OLDUSDT": {}}}')
+    guard._equity(conn, client)
+    assert calls == ["positions"]
+    assert D(trading._get(conn, "equity")) == (D(1000) if empty else D("1000.01"))
+    assert json.loads(trading._get(conn, "positions")) == {"at": clock[0], "items": items}
 
 
 def test_guard_cadence_persists_and_equity_is_decimal(env, monkeypatch):

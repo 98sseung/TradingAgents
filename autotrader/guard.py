@@ -1,5 +1,6 @@
 """Independent Risk Guard. Run even when the engine, worker, or GUI is stopped."""
 
+import json
 import time
 from decimal import Decimal as D
 
@@ -10,8 +11,16 @@ INTERVAL, RECONCILE_INTERVAL, EXPIRY_INTERVAL = 5, 30, 300
 
 
 def _equity(conn, client):
-    equity = D(client.balance()["wallet"]) + sum((D(p["unRealizedProfit"]) for p in client.positions()), D(0))
+    wallet = D(client.balance()["wallet"])
+    positions = client.positions()
+    equity = wallet + sum((D(p["unRealizedProfit"]) for p in positions), D(0))
     trading._set(conn, "equity", equity)
+    trading._set(conn, "positions", json.dumps({
+        "at": time.time(),
+        "items": {p["symbol"]: {key: p.get(key) for key in
+                              ("markPrice", "unRealizedProfit", "initialMargin", "notional")}
+                  for p in positions},
+    }))
 
 
 def step(conn, client, now):
