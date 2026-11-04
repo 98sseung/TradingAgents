@@ -115,3 +115,10 @@ def test_mechanical_scoring(env, monkeypatch, direction, high, low, close, resul
     assert feedback.score(conn, client, NOW + 120 * 3600) == 2
     assert conn.execute("SELECT mech_atr FROM outcomes WHERE horizon_h = 120").fetchone()[0] == pytest.approx(result - .025)
     assert conn.execute("SELECT mech_atr FROM outcomes WHERE horizon_h = 24").fetchone()[0] is None
+
+
+def test_stop_beyond_liquidation_distance_blocks_entry(env):
+    conn, client, clock, prices = env
+    j = job(conn, "Buy", source="shock", shock=json.dumps({"direction": 1, "atr": 20}))  # 1.5 ATR = 30% at mark 100
+    db.update(conn, j["id"], finished_at=NOW)
+    assert trading._evaluate(conn, client, db.get_job(conn, j["id"]))["reason"] == "Stop too far for 3x leverage"

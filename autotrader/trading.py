@@ -13,6 +13,7 @@ MAX_HOLD, COOLDOWN, MAX_AGE = 5 * 86400, 86400, 6 * 3600
 ACCOUNTING_SETTLE = 300  # income from separate fills can become visible at different times
 PERIOD, LONG_RSI, SHORT_RSI = 14, D(75), D(25)
 MIN_ATR, MAX_ATR, STOP_ATR, TARGET_R = D("0.5"), D(3), D("1.5"), D(2)
+MAX_STOP = D("0.20")  # isolated 3x liquidates near a 31% move: the stop must trigger well before that
 
 
 def symbol_for(ticker):
@@ -173,6 +174,8 @@ def _evaluate(conn, client, job):
                 stop = mark - direction * STOP_ATR * atr
             stop = round_price(stop, filters["tick_size"])
             risk = direction * (mark - stop)
+            if risk > mark * MAX_STOP:
+                raise ValueError("Stop too far for 3x leverage")
             target = D(0) if shock else D(str(job.get("price_target") or 0))
             if shock:
                 target = mark + direction * 3 * atr
